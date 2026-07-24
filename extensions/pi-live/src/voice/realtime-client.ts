@@ -292,8 +292,8 @@ export function buildDefaultSessionConfig(
 		};
 	} else {
 		// Full duplex voice: Realtime speaks + may call pi_turn.
-		// Include text so clients can show assistant transcripts alongside audio.
-		base.output_modalities = ["audio", "text"];
+		// GA only allows ["audio"] or ["text"] — not both.
+		base.output_modalities = ["audio"];
 		base.instructions = CONVERSATIONAL_INSTRUCTIONS;
 		base.tools = [PI_TURN_TOOL];
 		base.tool_choice = "auto";
@@ -373,6 +373,15 @@ function reasonToString(reason: Buffer | string | undefined): string {
 	if (reason == null) return "";
 	if (typeof reason === "string") return reason;
 	return reason.toString("utf8");
+}
+
+/** Server errors that are expected during barge-in / idle cancel. */
+function isBenignRealtimeError(message: string, code?: string): boolean {
+	const m = message.toLowerCase();
+	if (m.includes("no active response")) return true;
+	if (m.includes("cancellation failed") && m.includes("no active")) return true;
+	if (code === "response_cancel_not_active") return true;
+	return false;
 }
 
 /**
@@ -887,8 +896,13 @@ export class RealtimeClient implements RealtimeClientLike {
 			}
 			case "error": {
 				const err = event.error;
+				const message = err?.message ?? "Realtime server error";
+				// Barge-in always tries response.cancel; server errors if idle.
+				if (isBenignRealtimeError(message, err?.code)) {
+					break;
+				}
 				this.#emit("error", {
-					message: err?.message ?? "Realtime server error",
+					message,
 					code: err?.code,
 					eventId: err?.event_id ?? event.event_id,
 					raw: event,

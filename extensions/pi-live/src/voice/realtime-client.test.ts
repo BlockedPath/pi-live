@@ -193,7 +193,7 @@ describe("buildDefaultSessionConfig", () => {
 			model: "gpt-realtime-2.1",
 			mode: "conversational",
 		});
-		assert.deepEqual(session.output_modalities, ["audio", "text"]);
+		assert.deepEqual(session.output_modalities, ["audio"]);
 		assert.equal(session.instructions, CONVERSATIONAL_INSTRUCTIONS);
 		assert.deepEqual(session.tools, [PI_TURN_TOOL]);
 		assert.equal(session.tool_choice, "auto");
@@ -382,6 +382,15 @@ describe("RealtimeClient", () => {
 		assert.equal(errors.length, 1);
 		assert.equal(errors[0]!.message, "bad field");
 		assert.equal(errors[0]!.code, "invalid_value");
+
+		// Benign barge-in cancel noise must not surface.
+		ws.receive({
+			type: "error",
+			error: {
+				message: "Cancellation failed: no active response found",
+			},
+		});
+		assert.equal(errors.length, 1);
 
 		client.close();
 	});

@@ -111,6 +111,14 @@ class FakeClient implements RealtimeClientLike {
 		});
 	}
 
+	emitAudioDelta(delta: string, itemId = "item_audio"): void {
+		this.#emit("audio.delta", {
+			delta,
+			itemId,
+			timestamp: Date.now(),
+		});
+	}
+
 	emitTranscriptDone(text: string): void {
 		const event: TranscriptEvent = {
 			type: "final",
@@ -682,7 +690,7 @@ describe("VoiceSession", () => {
 			output_modalities?: string[];
 			tools?: Array<{ name?: string }>;
 		};
-		assert.deepEqual(last.output_modalities, ["audio", "text"]);
+		assert.deepEqual(last.output_modalities, ["audio"]);
 		assert.equal(last.tools?.[0]?.name, "pi_turn");
 
 		session.setMode("transcription");
@@ -739,11 +747,17 @@ describe("VoiceSession", () => {
 		assert.equal(client.responseCreates, 1);
 	});
 
-	it("speech_started barge-in cancels and truncates in conversational mode", async () => {
+	it("speech_started barge-in cancels only when assistant audio is active", async () => {
 		const { session, client } = makeSession({ mode: "conversational" });
 		await session.start({ pi: { sendUserMessage: () => undefined } });
-		// Seed pcm player item via audio.delta path is internal; barge-in still cancels.
+		// No assistant audio yet — cancel would 400 on the server.
+		client.emitSpeech("started");
+		assert.equal(client.cancels, 0);
+
+		// Seed realtime audio out, then barge in.
+		client.emitAudioDelta("AAAA", "item_audio");
 		client.emitSpeech("started");
 		assert.ok(client.cancels >= 1);
+		assert.ok(client.truncates.some((t) => t.itemId === "item_audio"));
 	});
 });

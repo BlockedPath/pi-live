@@ -1024,13 +1024,19 @@ export class VoiceSession {
 	 */
 	#bargeIn(client: RealtimeClientLike): void {
 		this.#playback.stop();
+		const wasRealtimeAudio =
+			this.#config.mode === "conversational" &&
+			(this.#pcmOut.isSpeaking() || Boolean(this.#pcmOut.getCurrentItemId()));
 		const { itemId, audioEndMs } = this.#pcmOut.stop();
+		// Only cancel/truncate when the assistant was actually producing audio.
+		// Bare response.cancel while idle → "Cancellation failed: no active response".
+		if (!wasRealtimeAudio) return;
 		try {
 			client.cancelResponse?.();
 		} catch {
 			// ignore
 		}
-		if (itemId && this.#config.mode === "conversational") {
+		if (itemId) {
 			try {
 				client.truncateConversationItem?.(itemId, audioEndMs, 0);
 			} catch {
