@@ -141,12 +141,14 @@ const SESSION_LIMIT_REFRESH_MS = 55 * 60 * 1000;
 /** Max wait for pi agent_settled while handling a pi_turn tool call. */
 const PI_TURN_TIMEOUT_MS = 180_000;
 /**
- * Min mic level (0–1) to treat speech_started as a real barge-in while the
- * assistant is talking. Below this is almost always speaker echo.
+ * Min mic level (0–1) for local barge-in while the assistant is talking.
+ * Tuned below typical close-talk speech; echo floor is tracked separately.
  */
-const BARGE_IN_LEVEL = 0.08;
-/** Ignore speech_started this long after assistant audio begins (echo settle). */
-const BARGE_IN_GRACE_MS = 400;
+const BARGE_IN_LEVEL = 0.04;
+/** Ignore barge-in this long after assistant audio begins (echo settle). */
+const BARGE_IN_GRACE_MS = 280;
+/** Consecutive loud capture ticks required before cutting the assistant. */
+const BARGE_IN_SUSTAIN = 3;
 
 function errorMessage(err: unknown): string {
 	if (err instanceof VoiceAuthError) return err.message;
@@ -242,6 +244,10 @@ export class VoiceSession {
 	#assistantItemId: string | undefined;
 	/** Date.now() when assistant audio last started (echo grace). */
 	#assistantAudioAt = 0;
+	/** Mic level baseline sampled as assistant audio starts (echo reference). */
+	#echoFloor = 0;
+	/** Sustained loud ticks while assistant is hot (local barge-in). */
+	#bargeLoudTicks = 0;
 
 	readonly #stateHandlers = new Set<StateChangeHandler>();
 	readonly #transcriptHandlers = new Set<TranscriptHandler>();
@@ -653,8 +659,17 @@ export class VoiceSession {
 				// Meter whenever capture is alive (including connecting).
 				this.#noteAudio(pcm);
 				if (this.#state !== "listening") return;
-				if (this.#capturePaused) return;
 				const active = this.#client;
+				// Local barge-in: while assistant audio plays we pause the uplink
+				// (echo), so the server never sees speech_started — detect from mic energy.
+				if (
+					active &&
+					this.#config.mode === "conversational" &&
+					this.#assistantIsHot()
+				) {
+					this.#maybeLocalBargeIn(active);
+				}
+				if (this.#capturePaused) return;
 				if (!active) return;
 				try {
 					active.appendAudio(pcm);
@@ -863,22 +878,11 @@ export class VoiceSession {
 			const event = args[0] as TranscriptEvent | undefined;
 			if (!event) return;
 			if (event.type === "speech_started") {
-				// Echo-resistant barge-in: while the assistant is talking, ignore
-				// low-level VAD (almost always speaker bleed into the mic).
-				const assistantHot =
-					this.#responseActive ||
-					this.#pcmOut.isSpeaking() ||
-					this.#pcmOut.hasAudio();
-				if (assistantHot) {
-					const inGrace =
-						Date.now() - this.#assistantAudioAt < BARGE_IN_GRACE_MS;
-					const loudEnough = this.#audioLevel >= BARGE_IN_LEVEL;
-					if (inGrace || !loudEnough) {
-						// Likely echo — do not cut the assistant mid-sentence.
-						return;
-					}
+				// Prefer local energy barge-in while assistant is hot; server VAD
+				// often never fires because we pause the uplink during playback.
+				if (this.#assistantIsHot()) {
+					if (!this.#userBargeInSignal()) return;
 				}
-				// Real user barge-in: kill speaker audio first.
 				this.#bargeIn(client);
 				this.#hearing = true;
 				this.#partial = "";
@@ -946,8 +950,10 @@ export class VoiceSession {
 			if (event.itemId) this.#assistantItemId = event.itemId;
 			if (firstChunk) {
 				this.#assistantAudioAt = Date.now();
-				// Drop any residual mic audio already in the server buffer so
-				// speaker echo cannot look like a new user turn.
+				// Snapshot current mic energy as echo reference.
+				this.#echoFloor = Math.max(this.#audioLevel, 0.01);
+				this.#bargeLoudTicks = 0;
+				// Drop residual mic audio already in the server buffer.
 				try {
 					(
 						client as { clearAudio?: () => void }
@@ -955,6 +961,8 @@ export class VoiceSession {
 				} catch {
 					// optional on fakes
 				}
+				// Pause uplink so speaker echo is not streamed back to the model.
+				// Local barge-in still runs from mic metering above.
 				this.setCapturePaused(true);
 			}
 			this.#pcmOut.appendBase64(event.delta, event.itemId);
@@ -1111,8 +1119,47 @@ export class VoiceSession {
 	 * Server VAD already cancels the in-progress response on speech_started;
 	 * we still send cancel + truncate for the WebSocket playback path.
 	 */
+	#assistantIsHot(): boolean {
+		return (
+			this.#responseActive ||
+			this.#pcmOut.isSpeaking() ||
+			this.#pcmOut.hasAudio()
+		);
+	}
+
+	/** True when mic energy looks like the user talking over the assistant. */
+	#userBargeInSignal(): boolean {
+		if (Date.now() - this.#assistantAudioAt < BARGE_IN_GRACE_MS) {
+			return false;
+		}
+		const floor = Math.max(this.#echoFloor, 0.015);
+		// Must beat both absolute floor and a multiple of the echo baseline.
+		const need = Math.max(BARGE_IN_LEVEL, floor * 2.2);
+		return this.#audioLevel >= need;
+	}
+
+	#maybeLocalBargeIn(client: RealtimeClientLike): void {
+		if (!this.#userBargeInSignal()) {
+			this.#bargeLoudTicks = 0;
+			return;
+		}
+		this.#bargeLoudTicks += 1;
+		if (this.#bargeLoudTicks < BARGE_IN_SUSTAIN) return;
+		this.#bargeLoudTicks = 0;
+		this.#bargeIn(client);
+		this.#hearing = true;
+		this.#partial = "";
+		this.#clearEchoGuardTimer();
+		if (!this.#agentBusy && this.#state === "listening") {
+			this.setCapturePaused(false);
+		}
+		this.#pushUiStatus();
+		this.#pushPartialWidget();
+	}
+
 	#bargeIn(client: RealtimeClientLike): void {
 		// Always cut local TTS / realtime PCM immediately.
+		this.#bargeLoudTicks = 0;
 		this.#playback.stop();
 		const hadAudio = this.#pcmOut.hasAudio() || this.#pcmOut.isSpeaking();
 		const itemId =
@@ -1510,6 +1557,8 @@ export class VoiceSession {
 		this.#responseActive = false;
 		this.#assistantItemId = undefined;
 		this.#assistantAudioAt = 0;
+		this.#echoFloor = 0;
+		this.#bargeLoudTicks = 0;
 		this.#audioChunks = 0;
 		this.#audioLevel = 0;
 		this.#lastLevelUiAt = 0;

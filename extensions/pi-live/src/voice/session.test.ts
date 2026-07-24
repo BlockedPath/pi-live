@@ -747,31 +747,31 @@ describe("VoiceSession", () => {
 		assert.equal(client.responseCreates, 1);
 	});
 
-	it("speech_started barge-in cancels only when assistant audio is active", async () => {
+	it("local mic energy barges in while assistant audio is playing", async () => {
 		const { session, client, capture } = makeSession({ mode: "conversational" });
 		await session.start({ pi: { sendUserMessage: () => undefined } });
 		// No assistant audio yet — cancel would 400 on the server.
 		client.emitSpeech("started");
 		assert.equal(client.cancels, 0);
 
-		// Seed realtime audio out (capture pauses for echo guard).
+		// Seed realtime audio out (uplink pauses; local barge-in still meters mic).
 		client.emitAudioDelta("AAAA", "item_audio");
-		// Echo-level mic noise should NOT barge in.
-		client.emitSpeech("started");
+
+		const quiet = new Uint8Array(64); // zeros — echo floor
+		for (let i = 0; i < 3; i++) capture.push(quiet);
+		// Quiet mic must not cut the assistant.
 		assert.equal(client.cancels, 0);
 
-		// Loud mic while assistant speaks = real barge-in.
+		// Leave echo grace window, then talk loudly over the assistant.
+		await new Promise((r) => setTimeout(r, 300));
 		const loud = new Uint8Array(64);
 		for (let i = 0; i < 64; i += 2) {
 			loud[i] = 0xff;
 			loud[i + 1] = 0x7f;
 		}
-		// noteAudio still runs while capture is paused.
-		for (let i = 0; i < 5; i++) capture.push(loud);
-		// Leave echo grace window.
-		await new Promise((r) => setTimeout(r, 450));
-		client.emitSpeech("started");
-		assert.ok(client.cancels >= 1);
+		// Sustained loud ticks trigger local barge-in without server speech_started.
+		for (let i = 0; i < 6; i++) capture.push(loud);
+		assert.ok(client.cancels >= 1, "expected local barge-in cancel");
 		assert.ok(client.truncates.some((t) => t.itemId === "item_audio"));
 	});
 });
