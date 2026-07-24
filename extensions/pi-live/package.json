@@ -7,11 +7,13 @@
   "main": "./src/index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test src/voice/realtime-client.test.ts",
+    "test": "node --experimental-strip-types --test src/voice/auth.test.ts src/voice/bridge.test.ts src/voice/realtime-client.test.ts",
     "pi": "pi -e ./src/index.ts"
   },
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   },
   "dependencies": {
     "ws": "^8.18.3"
