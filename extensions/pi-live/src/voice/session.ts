@@ -35,10 +35,10 @@ import {
 	voiceStateFromFields,
 	type VoiceStatePrefs,
 } from "./prefs.js";
+import { createVoiceClient } from "./backends/index.js";
 import {
 	buildDefaultSessionConfig,
 	connectConfigFromVoice,
-	RealtimeClient,
 	type RealtimeAudioDeltaEvent,
 	type RealtimeClientError,
 } from "./realtime-client.js";
@@ -263,7 +263,9 @@ export class VoiceSession {
 					codexHome: options.codexHome,
 					apiKey: options.apiKey,
 				}));
-		this.#createClient = deps.createClient ?? (() => new RealtimeClient());
+		this.#createClient =
+			deps.createClient ??
+			(() => createVoiceClient(this.#config, { spawn: deps.spawn }));
 		this.#createCapture =
 			deps.createCapture ??
 			((opts) =>
@@ -390,6 +392,7 @@ export class VoiceSession {
 			captureBackend: this.#captureBackend,
 			relayTarget: this.#config.relayTarget,
 			relayMode: this.#config.relayMode,
+			backend: this.#config.backend,
 			error: this.#error,
 		};
 	}

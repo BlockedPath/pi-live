@@ -55,6 +55,8 @@ function formatVoiceStatus(): string {
 		`auth=${info.auth}`,
 	];
 	if (info.authMode) parts.push(`authMode=${info.authMode}`);
+	if (info.backend && info.backend !== "openai")
+		parts.push(`backend=${info.backend}`);
 	parts.push(
 		`model=${info.model}`,
 		`voice=${info.voice}`,

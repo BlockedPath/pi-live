@@ -11,6 +11,15 @@ import type { VoiceAuthPrefer, VoiceMode } from "./types.js";
 
 export type VoiceRelayMode = "local" | "relay" | "both";
 
+/**
+ * Which realtime transport drives the voice session (VS9 / issue #16).
+ * - `openai` (default) — pi talks to the OpenAI Realtime WebSocket API directly.
+ * - `codex` — drive the local Codex CLI `app-server` realtime V3 session and map
+ *   its `thread/realtime/*` events into the existing `/voice` UX. Requires the
+ *   `codex` binary on PATH; errors clearly when absent.
+ */
+export type VoiceBackend = "openai" | "codex";
+
 export interface VoiceConfig {
 	/** `transcription` (default) or `conversational` (VS8 pi_turn). */
 	mode: VoiceMode;
@@ -47,6 +56,11 @@ export interface VoiceConfig {
 	relayMode: VoiceRelayMode;
 	/** Optional explicit API key override (never logged). */
 	apiKey?: string;
+	/**
+	 * Realtime backend selection (VS9). `openai` (default) keeps the pi-native
+	 * Realtime WebSocket path; `codex` drives `codex app-server` realtime V3.
+	 */
+	backend: VoiceBackend;
 }
 
 const DEFAULTS = {
@@ -56,7 +70,13 @@ const DEFAULTS = {
 	auth: "auto" as VoiceAuthPrefer,
 	sampleRate: 24_000,
 	relayMode: "local" as VoiceRelayMode,
+	backend: "openai" as VoiceBackend,
 } as const;
+
+function parseBackend(raw: string | undefined): VoiceBackend {
+	if (raw === "codex" || raw === "openai") return raw;
+	return DEFAULTS.backend;
+}
 
 function expandHome(path: string): string {
 	if (path === "~") return homedir();
@@ -117,6 +137,7 @@ export function loadVoiceConfig(
 			Boolean(relayTarget),
 		),
 		apiKey: apiKey || undefined,
+		backend: parseBackend(env.PI_VOICE_BACKEND?.trim()),
 	};
 }
 

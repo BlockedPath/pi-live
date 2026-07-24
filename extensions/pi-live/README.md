@@ -6,7 +6,8 @@ demo surface plus a **voice transcription / conversational** loop (epic
 [#12](https://github.com/BlockedPath/pi-live/issues/12) /
 [#13](https://github.com/BlockedPath/pi-live/issues/13) /
 [#14](https://github.com/BlockedPath/pi-live/issues/14) /
-[#15](https://github.com/BlockedPath/pi-live/issues/15)).
+[#15](https://github.com/BlockedPath/pi-live/issues/15) /
+[#16](https://github.com/BlockedPath/pi-live/issues/16)).
 
 - custom tool: `hello`
 - `session_start` hook with a UI notification
@@ -92,7 +93,26 @@ Two modes (default **transcription**):
 | **transcription** (default) | Mic → Realtime STT only (`output_modalities: ["text"]`) → final transcript bridges into pi → optional local/OpenAI TTS speak-back | Lower — mostly input transcription + optional short TTS |
 | **conversational** | Mic ↔ Realtime full-duplex audio; model may call **`pi_turn({ message })` only**; pi runs the coding turn; tool result returns as `function_call_output`; Realtime speaks a brief status | Higher — continuous realtime audio in/out + tool rounds |
 
-In both modes **the Realtime model never edits files or runs shell** — coding always goes through pi (`sendUserMessage` / `pi_turn` → agent loop).
+On the default OpenAI backend, **the Realtime model never edits files or runs shell** — coding always goes through pi (`sendUserMessage` / `pi_turn` → agent loop).
+
+### Realtime backends
+
+| Backend | Enable | Transport | Behavior |
+| --- | --- | --- | --- |
+| **OpenAI** (default) | Leave `PI_VOICE_BACKEND` unset or set it to `openai` | Pi connects directly to the OpenAI Realtime WebSocket | Existing transcription and conversational `pi_turn` path; unchanged |
+| **Codex app-server V3** (experimental) | `PI_VOICE_BACKEND=codex` | Pi spawns local `codex app-server --stdio` and adapts `thread/realtime/*` JSON-RPC events | Reuses the same capture, status, transcript widget, playback, prefs, and transcription bridge |
+
+The Codex backend is strictly opt-in. Missing or invalid values fall back to `openai`. It requires a recent Codex CLI with experimental realtime V3 support (the adapter was researched against the Codex 0.145.0 protocol) and a logged-in Codex session. The extension checks `codex --version` first and reports a clear error when the CLI is unavailable.
+
+Codex V3 limitations:
+
+- **Transcription mode is recommended for coding:** final user transcripts still bridge to pi normally.
+- In conversational mode, Codex's own handoff mechanism is not mapped to pi's `pi_turn`; handoff items are ignored by this adapter.
+- Codex exposes no documented server-VAD markers or output-audio completion event, so the adapter synthesizes speech markers from transcript events and finishes audio on the assistant transcript final.
+- The exact `thread/realtime/transcript/done` wire name is inferred from the protocol type and remains an experimental compatibility assumption.
+- Live `updateSession` and OpenAI-style function-call/cancel/truncate methods are unavailable; stop and restart voice after changing modes.
+
+These differences are confined to the thin `RealtimeClientLike` adapter; the default OpenAI client and pi-native session path are not rewritten.
 
 ### Prerequisites
 
@@ -113,7 +133,7 @@ In both modes **the Realtime model never edits files or runs shell** — coding 
 
    Confirm: `which rec || which sox`.
 
-3. **Network** to `wss://api.openai.com/v1/realtime`.
+3. **Network** to the selected provider. The default OpenAI backend connects directly to `wss://api.openai.com/v1/realtime`; the Codex backend delegates the provider connection to the local `codex app-server` child.
 
 ### Commands
 
@@ -148,15 +168,14 @@ Transcript widget (above the editor, when `setWidget` is available):
 
 ### Privacy
 
-**Microphone audio is streamed to OpenAI’s Realtime API** for transcription.
-Do not use `/voice start` on sensitive audio. Tokens from `~/.codex/auth.json`
-or API keys are never written into pi session transcripts or status lines.
+**Microphone audio leaves your machine for provider-side Realtime processing.** The default backend streams directly to OpenAI; the Codex backend passes PCM to the local Codex app-server, which sends it to its configured provider. Neither mode is offline. Do not use `/voice start` on sensitive audio. Tokens from `~/.codex/auth.json` or API keys are never written into pi session transcripts or status lines.
 
 ### Config (`PI_VOICE_*`)
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `PI_VOICE_MODE` | `transcription` | `transcription` (default) or `conversational` (Realtime audio + `pi_turn`) |
+| `PI_VOICE_BACKEND` | `openai` | `openai` (pi-native direct WebSocket) or `codex` (experimental local Codex app-server V3 adapter) |
+| `PI_VOICE_MODE` | `transcription` | `transcription` (default) or `conversational` (Realtime audio + `pi_turn` on the OpenAI backend) |
 | `PI_VOICE_MODEL` | `gpt-realtime-2.1` | Realtime model id |
 | `PI_VOICE_VOICE` | `marin` | TTS voice (OpenAI names for `openai`; macOS voice name for `say`, e.g. `Samantha`) |
 | `PI_VOICE_TTS` | `say` on macOS, else `off` | Speak-back backend: `say` \| `openai` \| `off` |
@@ -197,6 +216,22 @@ pi -e ./src/index.ts
 # /voice start  → speak a task → pi works → hears a short spoken summary
 ```
 
+### Manual test — Codex app-server V3 (experimental)
+
+```bash
+cd extensions/pi-live && npm install
+codex --version
+codex login                       # if not already logged in
+export PI_VOICE_BACKEND=codex
+export PI_VOICE_MODE=transcription # recommended: coding stays in pi
+pi -e ./src/index.ts
+# /voice status  → includes backend=codex
+# /voice start   → speak a task → final transcript bridges into pi
+# /voice stop
+```
+
+Unset `PI_VOICE_BACKEND` (or set it to `openai`) to return to the default direct WebSocket backend. Backend selection is environment-only and is not persisted in `voice-state`.
+
 ### Manual test — conversational (`pi_turn`)
 
 ```bash
@@ -232,6 +267,8 @@ Without `play`, barge-in truncate timing still works; you just won't hear audio 
 | Symptom | What to check |
 | --- | --- |
 | `No voice auth available` / `missing_auth` | `ls ~/.codex/auth.json` or set `OPENAI_API_KEY` / `PI_VOICE_API_KEY`. Prefer `PI_VOICE_AUTH=codex` or `api-key` to force one path. |
+| `codex backend requires the Codex CLI` | Install/update Codex, ensure `codex` is on the pi process `PATH`, run `codex --version`, and log in. Or unset `PI_VOICE_BACKEND` to use the default OpenAI backend. |
+| `codex realtime rejected start` / closes before started | The installed CLI/account may not expose experimental realtime V3. Update Codex, re-run `codex login`, or use `PI_VOICE_BACKEND=openai`. |
 | `sox/rec not found on PATH` | `brew install sox`; ensure Homebrew’s bin is on `PATH` inside the pi process. |
 | WS 401 / 403 | OAuth expired — re-login via Codex; or switch to a valid API key. |
 | WS closes immediately | Model id / account entitlements; try `PI_VOICE_MODEL=gpt-realtime-mini` if available on your account. |
@@ -251,17 +288,15 @@ Without `play`, barge-in truncate timing still works; you just won't hear audio 
 | `types.ts` | Shared contracts (auth, session, transcripts, bridge) |
 | `config.ts` | `PI_VOICE_*` env → typed config |
 | `auth.ts` | Codex OAuth load/refresh + API key fallback |
-| `realtime-client.ts` | GA Realtime WebSocket client (+ `pi_turn` session / tool events) |
+| `realtime-client.ts` | Default GA Realtime WebSocket client (+ `pi_turn` session / tool events) |
+| `backends/index.ts` | Environment-selected `RealtimeClientLike` factory |
+| `backends/codex-app-server.ts` | Experimental Codex app-server realtime V3 stdio adapter |
 | `capture.ts` | mic → PCM16 mono via sox/rec |
 | `bridge.ts` | final text → `pi.sendUserMessage` (idle / steer) |
 | `playback.ts` | TTS speak-back (`say` / OpenAI / off) |
 | `prefs.ts` | `voice-state` parse/restore helpers |
 | `session.ts` | start/stop/status + reconnect + widget + speakBack + conversational pi_turn |
 | `index.ts` | Public barrel |
-
-### Later slices
-
-- #16 optional Codex app-server backend  
 
 Session hooks: `setCapturePaused`, `speakBack`, `setMode`, `notifyAgentSettled`,
 `onStateChange`, `applyPrefs` / `getPrefs`.
