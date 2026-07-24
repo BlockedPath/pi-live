@@ -466,3 +466,189 @@ export class VoicePlayback {
 		}
 	}
 }
+
+
+/**
+ * Stream PCM16 mono realtime audio out via sox `play` (VS8 conversational).
+ * Falls back to a silent byte counter when `play` is unavailable so barge-in
+ * still reports audio_end_ms for conversation.item.truncate.
+ */
+export interface PcmStreamPlayerOptions {
+	sampleRate?: number;
+	spawn?: SpawnFn;
+	/** Override player binary (default: `play` from sox). */
+	command?: string;
+}
+
+export class PcmStreamPlayer {
+	readonly #sampleRate: number;
+	readonly #spawn: SpawnFn;
+	readonly #command: string;
+	readonly #handlers = new Set<SpeakingHandler>();
+
+	#child: ChildProcess | undefined;
+	#stdinFailed = false;
+	#bytesWritten = 0;
+	#itemId: string | undefined;
+	#speaking = false;
+	#generation = 0;
+
+	constructor(options: PcmStreamPlayerOptions = {}) {
+		this.#sampleRate = options.sampleRate ?? 24_000;
+		this.#spawn = options.spawn ?? defaultSpawn;
+		this.#command = options.command ?? "play";
+	}
+
+	isSpeaking(): boolean {
+		return this.#speaking;
+	}
+
+	/** Milliseconds of PCM accepted so far for the current item. */
+	getPlayedMs(): number {
+		// PCM16 mono: 2 bytes/sample
+		const samples = Math.floor(this.#bytesWritten / 2);
+		return Math.floor((samples * 1000) / this.#sampleRate);
+	}
+
+	getCurrentItemId(): string | undefined {
+		return this.#itemId;
+	}
+
+	onSpeakingChange(handler: SpeakingHandler): () => void {
+		this.#handlers.add(handler);
+		return () => {
+			this.#handlers.delete(handler);
+		};
+	}
+
+	/**
+	 * Append a base64 PCM16 chunk. Lazily starts the player process.
+	 */
+	appendBase64(delta: string, itemId?: string): void {
+		if (!delta) return;
+		let buf: Buffer;
+		try {
+			buf = Buffer.from(delta, "base64");
+		} catch {
+			return;
+		}
+		if (buf.byteLength === 0) return;
+
+		if (itemId && itemId !== this.#itemId) {
+			// New assistant item — restart stream accounting.
+			this.stop();
+			this.#itemId = itemId;
+		} else if (itemId) {
+			this.#itemId = itemId;
+		}
+
+		this.#ensureChild();
+		this.#bytesWritten += buf.byteLength;
+		this.#setSpeaking(true);
+
+		const child = this.#child;
+		if (!child?.stdin || this.#stdinFailed || child.stdin.destroyed) {
+			return;
+		}
+		try {
+			const ok = child.stdin.write(buf);
+			if (!ok) {
+				// Backpressure — drop further writes until drain; ignore for MVP.
+			}
+		} catch {
+			this.#stdinFailed = true;
+		}
+	}
+
+	/** Mark the current audio segment complete (player may still be draining). */
+	done(): void {
+		const child = this.#child;
+		if (child?.stdin && !child.stdin.destroyed) {
+			try {
+				child.stdin.end();
+			} catch {
+				// ignore
+			}
+		}
+	}
+
+	/**
+	 * Stop playback immediately.
+	 * @returns item id + audio_end_ms suitable for conversation.item.truncate
+	 */
+	stop(): { itemId?: string; audioEndMs: number } {
+		const itemId = this.#itemId;
+		const audioEndMs = this.getPlayedMs();
+		this.#generation++;
+		const child = this.#child;
+		this.#child = undefined;
+		this.#stdinFailed = false;
+		this.#bytesWritten = 0;
+		this.#itemId = undefined;
+		if (child) {
+			try {
+				child.kill("SIGTERM");
+			} catch {
+				// ignore
+			}
+		}
+		this.#setSpeaking(false);
+		return { itemId, audioEndMs };
+	}
+
+	#ensureChild(): void {
+		if (this.#child && !this.#child.killed) return;
+		const gen = this.#generation;
+		try {
+			const child = this.#spawn(
+				this.#command,
+				[
+					"-q",
+					"-t",
+					"raw",
+					"-r",
+					String(this.#sampleRate),
+					"-e",
+					"signed-integer",
+					"-b",
+					"16",
+					"-c",
+					"1",
+					"-",
+				],
+				{
+					stdio: ["pipe", "ignore", "ignore"],
+					env: process.env,
+				},
+			);
+			this.#child = child;
+			this.#stdinFailed = false;
+			child.on("error", () => {
+				if (gen !== this.#generation) return;
+				// Missing `play` binary — keep counting bytes for truncate timing.
+				this.#child = undefined;
+				this.#stdinFailed = true;
+			});
+			child.on("close", () => {
+				if (gen !== this.#generation) return;
+				if (this.#child === child) this.#child = undefined;
+				this.#setSpeaking(false);
+			});
+		} catch {
+			this.#child = undefined;
+			this.#stdinFailed = true;
+		}
+	}
+
+	#setSpeaking(next: boolean): void {
+		if (this.#speaking === next) return;
+		this.#speaking = next;
+		for (const handler of this.#handlers) {
+			try {
+				handler(next);
+			} catch {
+				// ignore
+			}
+		}
+	}
+}

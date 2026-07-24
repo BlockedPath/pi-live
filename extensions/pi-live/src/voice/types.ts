@@ -135,13 +135,37 @@ export type DeliverVoiceText = (
 	opts?: DeliverVoiceTextOptions,
 ) => void;
 
-/** Minimal surface the Realtime client (#9) is expected to expose. */
+/** Realtime model tool call (VS8 conversational `pi_turn`). */
+export interface FunctionCallEvent {
+	/** Tool name (expected: `pi_turn`). */
+	name: string;
+	/** Provider call id — required for function_call_output. */
+	callId: string;
+	/** Raw JSON arguments string from the model. */
+	arguments: string;
+	itemId?: string;
+	timestamp: number;
+}
+
+/** Minimal surface the Realtime client (#9 / #15) is expected to expose. */
 export interface RealtimeClientLike {
 	connect(authHeaders: Record<string, string>, config: unknown): Promise<void>;
 	close(): void;
 	appendAudio(pcm16Base64OrBuffer: string | Uint8Array): void;
 	on(event: string, handler: (...args: unknown[]) => void): void;
 	updateSession(partial: unknown): void;
+	/** VS8: return tool result to the Realtime conversation. */
+	sendFunctionCallOutput?(callId: string, output: string): void;
+	/** VS8: ask the model to continue after a tool result. */
+	createResponse?(response?: Record<string, unknown>): void;
+	/** VS8: cancel in-flight model response (barge-in). */
+	cancelResponse?(): void;
+	/** VS8: truncate unplayed assistant audio after barge-in. */
+	truncateConversationItem?(
+		itemId: string,
+		audioEndMs: number,
+		contentIndex?: number,
+	): void;
 }
 
 /** Minimal surface the mic capture module (#10) is expected to expose. */

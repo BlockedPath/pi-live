@@ -1,9 +1,10 @@
 /**
  * Public barrel for the pi-live voice module.
  *
- * Stable export surface across voice slices (#7–#14+).
+ * Stable export surface across voice slices (#7–#15+).
  * VS5: VoiceSession state machine. VS6: playback / TTS speak-back.
  * VS7: prefs, reconnect, widget polish.
+ * VS8: conversational mode + pi_turn.
  */
 
 export {
@@ -48,11 +49,13 @@ export {
 export {
 	DEFAULT_SPEAK_MAX_CHARS,
 	extractLastAssistantText,
+	PcmStreamPlayer,
 	resolveTtsBackend,
 	speak,
 	summarizeForSpeech,
 	VoicePlayback,
 	type FetchFn,
+	type PcmStreamPlayerOptions,
 	type SpeakOptions,
 	type SpawnFn,
 	type TtsBackend,
@@ -62,9 +65,13 @@ export {
 export {
 	buildDefaultSessionConfig,
 	connectConfigFromVoice,
+	CONVERSATIONAL_INSTRUCTIONS,
 	DEFAULT_REALTIME_URL,
 	mergeSessionConfig,
+	PI_TURN_TOOL,
 	RealtimeClient,
+	type RealtimeAudioDeltaEvent,
+	type RealtimeAudioDoneEvent,
 	type RealtimeClientError,
 	type RealtimeClientEvent,
 	type RealtimeClientEventMap,
@@ -80,6 +87,7 @@ export type {
 	BridgeDeliveryMode,
 	DeliverVoiceText,
 	DeliverVoiceTextOptions,
+	FunctionCallEvent,
 	MicCaptureLike,
 	RealtimeClientLike,
 	ResolveVoiceAuth,

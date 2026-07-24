@@ -8,13 +8,15 @@ import { describe, it } from "node:test";
 
 import {
 	buildDefaultSessionConfig,
+	CONVERSATIONAL_INSTRUCTIONS,
 	mergeSessionConfig,
+	PI_TURN_TOOL,
 	RealtimeClient,
 	type RealtimeServerEvent,
 	type WebSocketFactory,
 	type WebSocketLike,
 } from "./realtime-client.ts";
-import type { TranscriptEvent } from "./types.ts";
+import type { FunctionCallEvent, TranscriptEvent } from "./types.ts";
 
 /** Minimal EventEmitter-style mock matching the `ws` surface we use. */
 class MockWebSocket implements WebSocketLike {
@@ -192,6 +194,18 @@ describe("buildDefaultSessionConfig", () => {
 			mode: "conversational",
 		});
 		assert.deepEqual(session.output_modalities, ["audio"]);
+		assert.equal(session.instructions, CONVERSATIONAL_INSTRUCTIONS);
+		assert.deepEqual(session.tools, [PI_TURN_TOOL]);
+		assert.equal(session.tool_choice, "auto");
+	});
+
+	it("clears tools in transcription mode", () => {
+		const session = buildDefaultSessionConfig({
+			model: "gpt-realtime-2.1",
+			mode: "transcription",
+		});
+		assert.deepEqual(session.tools, []);
+		assert.equal(session.tool_choice, "none");
 	});
 });
 
@@ -422,6 +436,83 @@ describe("RealtimeClient", () => {
 		ws.receive({ type: "input_audio_buffer.speech_stopped", item_id: "i1" });
 
 		assert.deepEqual(events, ["started", "stopped"]);
+		client.close();
+	});
+
+	it("emits function_call from response.function_call_arguments.done", async () => {
+		const { client, sockets } = createHarness();
+		const ws = await connectReady(client, sockets);
+		const calls: FunctionCallEvent[] = [];
+		client.on("function_call", (ev) => calls.push(ev));
+
+		ws.receive({
+			type: "response.function_call_arguments.done",
+			name: "pi_turn",
+			call_id: "call_1",
+			arguments: '{"message":"list files"}',
+			item_id: "item_fc",
+		});
+
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0]!.name, "pi_turn");
+		assert.equal(calls[0]!.callId, "call_1");
+		assert.equal(calls[0]!.arguments, '{"message":"list files"}');
+		client.close();
+	});
+
+	it("sendFunctionCallOutput + createResponse send expected events", async () => {
+		const { client, sockets } = createHarness();
+		const ws = await connectReady(client, sockets);
+
+		client.sendFunctionCallOutput("call_9", '{"ok":true,"summary":"done"}');
+		client.createResponse();
+
+		const creates = ws.sentOfType("conversation.item.create") as Array<{
+			item: { type: string; call_id: string; output: string };
+		}>;
+		assert.equal(creates.length, 1);
+		assert.equal(creates[0]!.item.type, "function_call_output");
+		assert.equal(creates[0]!.item.call_id, "call_9");
+		assert.equal(creates[0]!.item.output, '{"ok":true,"summary":"done"}');
+
+		const responses = ws.sentOfType("response.create");
+		assert.equal(responses.length, 1);
+		client.close();
+	});
+
+	it("emits audio.delta / audio.done for output audio", async () => {
+		const { client, sockets } = createHarness();
+		const ws = await connectReady(client, sockets);
+		const deltas: string[] = [];
+		const dones: number[] = [];
+		client.on("audio.delta", (ev) => deltas.push(ev.delta));
+		client.on("audio.done", () => dones.push(1));
+
+		ws.receive({
+			type: "response.output_audio.delta",
+			item_id: "a1",
+			delta: "AAAA",
+		});
+		ws.receive({ type: "response.output_audio.done", item_id: "a1" });
+
+		assert.deepEqual(deltas, ["AAAA"]);
+		assert.equal(dones.length, 1);
+		client.close();
+	});
+
+	it("cancelResponse and truncateConversationItem send client events", async () => {
+		const { client, sockets } = createHarness();
+		const ws = await connectReady(client, sockets);
+		client.cancelResponse();
+		client.truncateConversationItem("item_x", 1500, 0);
+		assert.equal(ws.sentOfType("response.cancel").length, 1);
+		const truncs = ws.sentOfType("conversation.item.truncate") as Array<{
+			item_id: string;
+			audio_end_ms: number;
+		}>;
+		assert.equal(truncs.length, 1);
+		assert.equal(truncs[0]!.item_id, "item_x");
+		assert.equal(truncs[0]!.audio_end_ms, 1500);
 		client.close();
 	});
 });

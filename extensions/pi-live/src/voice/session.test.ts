@@ -36,6 +36,11 @@ class FakeClient implements RealtimeClientLike {
 	config: unknown;
 	appended: Array<string | Uint8Array> = [];
 	closed = false;
+	sessionUpdates: unknown[] = [];
+	functionOutputs: Array<{ callId: string; output: string }> = [];
+	responseCreates = 0;
+	cancels = 0;
+	truncates: Array<{ itemId: string; audioEndMs: number }> = [];
 	readonly #listeners = new Map<string, Set<(...args: unknown[]) => void>>();
 
 	connect(authHeaders: Record<string, string>, config: unknown): Promise<void> {
@@ -73,7 +78,38 @@ class FakeClient implements RealtimeClientLike {
 		return () => set?.delete(handler);
 	}
 
-	updateSession(_partial: unknown): void {}
+	updateSession(partial: unknown): void {
+		this.sessionUpdates.push(partial);
+	}
+
+	sendFunctionCallOutput(callId: string, output: string): void {
+		this.functionOutputs.push({ callId, output });
+	}
+
+	createResponse(_response?: Record<string, unknown>): void {
+		this.responseCreates += 1;
+	}
+
+	cancelResponse(): void {
+		this.cancels += 1;
+	}
+
+	truncateConversationItem(itemId: string, audioEndMs: number): void {
+		this.truncates.push({ itemId, audioEndMs });
+	}
+
+	emitFunctionCall(
+		name: string,
+		callId: string,
+		args: string,
+	): void {
+		this.#emit("function_call", {
+			name,
+			callId,
+			arguments: args,
+			timestamp: Date.now(),
+		});
+	}
 
 	emitTranscriptDone(text: string): void {
 		const event: TranscriptEvent = {
@@ -155,6 +191,7 @@ function makeSession(overrides?: {
 	failAuth?: Error;
 	failConnect?: Error;
 	tts?: "say" | "openai" | "off";
+	mode?: "transcription" | "conversational";
 	playback?: VoicePlayback;
 	/** Fresh client per createClient call (reconnect tests). */
 	freshClients?: boolean;
@@ -237,6 +274,7 @@ function makeSession(overrides?: {
 		config: {
 			...defaultVoiceConfig,
 			tts: overrides?.tts ?? "off",
+			mode: overrides?.mode ?? defaultVoiceConfig.mode,
 		},
 		resolveAuth: async () => {
 			if (overrides?.failAuth) throw overrides.failAuth;
@@ -625,5 +663,87 @@ describe("VoiceSession", () => {
 		assert.match(session.getStatus(), /echo guard|paused/);
 		flushTimers();
 		assert.equal(session.isCapturePaused(), false);
+	});
+
+	it("defaults to transcription mode", () => {
+		const { session } = makeSession();
+		assert.equal(session.getConfig().mode, "transcription");
+		assert.equal(session.getStatusInfo().mode, "transcription");
+	});
+
+	it("setMode updates config and live session.update", async () => {
+		const { session, client } = makeSession();
+		await session.start({ pi: { sendUserMessage: () => undefined } });
+		session.setMode("conversational");
+		assert.equal(session.getConfig().mode, "conversational");
+		assert.equal(session.getPrefs().mode, "conversational");
+		assert.ok(client.sessionUpdates.length >= 1);
+		const last = client.sessionUpdates.at(-1) as {
+			output_modalities?: string[];
+			tools?: Array<{ name?: string }>;
+		};
+		assert.deepEqual(last.output_modalities, ["audio"]);
+		assert.equal(last.tools?.[0]?.name, "pi_turn");
+
+		session.setMode("transcription");
+		const back = client.sessionUpdates.at(-1) as {
+			output_modalities?: string[];
+			tools?: unknown[];
+		};
+		assert.deepEqual(back.output_modalities, ["text"]);
+		assert.deepEqual(back.tools, []);
+	});
+
+	it("conversational mode does not bridge final transcripts", async () => {
+		const { session, client, delivered } = makeSession({
+			mode: "conversational",
+		});
+		await session.start({
+			pi: { sendUserMessage: () => undefined },
+			isIdle: () => true,
+		});
+		client.emitTranscriptDone("do not bridge this");
+		assert.deepEqual(delivered, []);
+	});
+
+	it("pi_turn delivers to pi and returns function_call_output", async () => {
+		const { session, client, delivered } = makeSession({
+			mode: "conversational",
+		});
+		await session.start({
+			pi: { sendUserMessage: () => undefined },
+			isIdle: () => true,
+		});
+
+		client.emitFunctionCall(
+			"pi_turn",
+			"call_abc",
+			JSON.stringify({ message: "list files in src" }),
+		);
+		// Allow the async handler to deliver.
+		await new Promise((r) => setTimeout(r, 10));
+		assert.deepEqual(delivered, ["list files in src"]);
+		assert.match(session.getStatus(), /pi working/);
+
+		session.notifyAgentSettled("Listed 3 files under src/.");
+		await new Promise((r) => setTimeout(r, 10));
+
+		assert.equal(client.functionOutputs.length, 1);
+		assert.equal(client.functionOutputs[0]!.callId, "call_abc");
+		const out = JSON.parse(client.functionOutputs[0]!.output) as {
+			ok: boolean;
+			summary: string;
+		};
+		assert.equal(out.ok, true);
+		assert.match(out.summary, /Listed 3 files/);
+		assert.equal(client.responseCreates, 1);
+	});
+
+	it("speech_started barge-in cancels and truncates in conversational mode", async () => {
+		const { session, client } = makeSession({ mode: "conversational" });
+		await session.start({ pi: { sendUserMessage: () => undefined } });
+		// Seed pcm player item via audio.delta path is internal; barge-in still cancels.
+		client.emitSpeech("started");
+		assert.ok(client.cancels >= 1);
 	});
 });

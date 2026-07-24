@@ -1,8 +1,8 @@
 /**
- * GA OpenAI Realtime WebSocket client (VS2 / issue #9).
+ * GA OpenAI Realtime WebSocket client (VS2 / issue #9, VS8 / #15).
  *
- * Transcription-first; session shape is extensible for conversational mode later.
- * Protocol constraints:
+ * Transcription MVP + conversational mode (`pi_turn` tool, audio out,
+ * function_call_output). Protocol constraints:
  *   - wss://api.openai.com/v1/realtime?model=…
  *   - no OpenAI-Beta realtime=v1 header
  *   - session.type "realtime" on every session.update
@@ -12,7 +12,11 @@
 import WebSocket from "ws";
 
 import type { VoiceConfig } from "./config.js";
-import type { RealtimeClientLike, TranscriptEvent } from "./types.js";
+import type {
+	FunctionCallEvent,
+	RealtimeClientLike,
+	TranscriptEvent,
+} from "./types.js";
 
 /** Default Realtime WS origin (override in tests). */
 export const DEFAULT_REALTIME_URL = "wss://api.openai.com/v1/realtime";
@@ -36,6 +40,43 @@ export interface RealtimeOutputAudioConfig {
 	format?: RealtimeAudioFormat;
 	voice?: string;
 }
+
+/** Narrow tool surface for conversational mode (VS8). */
+export const PI_TURN_TOOL = {
+	type: "function" as const,
+	name: "pi_turn",
+	description:
+		"Delegate a coding or repository task to the pi agent. Use for ANY " +
+		"file reads/edits, shell commands, searches, git, tests, or other " +
+		"coding work. Do not invent file contents or claim you ran commands.",
+	parameters: {
+		type: "object",
+		properties: {
+			message: {
+				type: "string",
+				description:
+					"Clear instruction for the pi coding agent (what to do in the repo).",
+			},
+		},
+		required: ["message"],
+	},
+} as const;
+
+/**
+ * System instructions for conversational mode.
+ * Voice model holds chit-chat; all coding goes through `pi_turn`.
+ */
+export const CONVERSATIONAL_INSTRUCTIONS = [
+	"You are a voice pair-programming partner sitting next to the pi coding agent.",
+	"You hold a brief spoken conversation with the user.",
+	"ALL coding, file reads/edits, shell, git, tests, and repository work MUST go",
+	"through the pi_turn tool — never invent file contents, diffs, or command output.",
+	"When the user asks for coding work, call pi_turn with a clear message, then",
+	"summarize the tool result briefly in speech.",
+	"Keep spoken replies short (one or two sentences). Do not monologue.",
+	"If you are unsure what the user wants, ask a short clarifying question instead",
+	"of guessing or calling pi_turn with a vague task.",
+].join(" ");
 
 /**
  * Session body sent inside `session.update`.
@@ -79,6 +120,12 @@ export type RealtimeClientEventMap = {
 	"transcript.done": [event: TranscriptEvent];
 	"speech.started": [event: TranscriptEvent];
 	"speech.stopped": [event: TranscriptEvent];
+	/** Conversational: model requested a tool (typically `pi_turn`). */
+	function_call: [event: FunctionCallEvent];
+	/** Conversational: base64 PCM16 audio chunk from the model. */
+	"audio.delta": [event: RealtimeAudioDeltaEvent];
+	/** Conversational: end of an assistant audio segment. */
+	"audio.done": [event: RealtimeAudioDoneEvent];
 	error: [error: RealtimeClientError];
 	close: [info: { code: number; reason: string }];
 	/** Raw parsed server event for extensibility (tools, audio deltas, …). */
@@ -96,12 +143,31 @@ export interface RealtimeClientError {
 	raw?: unknown;
 }
 
+/** Audio output chunk from the Realtime model (conversational). */
+export interface RealtimeAudioDeltaEvent {
+	/** Base64-encoded PCM16 mono audio. */
+	delta: string;
+	itemId?: string;
+	responseId?: string;
+	timestamp: number;
+}
+
+export interface RealtimeAudioDoneEvent {
+	itemId?: string;
+	responseId?: string;
+	timestamp: number;
+}
+
 /** Minimal server event shape we parse. */
 export interface RealtimeServerEvent {
 	type: string;
 	event_id?: string;
 	session?: unknown;
 	item_id?: string;
+	response_id?: string;
+	call_id?: string;
+	name?: string;
+	arguments?: string;
 	delta?: string;
 	transcript?: string;
 	error?: {
@@ -158,8 +224,8 @@ function pcmFormat(sampleRate: number): RealtimeAudioFormat {
 }
 
 /**
- * Build the default GA session.update body for transcription (MVP) or
- * conversational (later) mode. Always includes `type: "realtime"`.
+ * Build the default GA session.update body for transcription or
+ * conversational mode. Always includes `type: "realtime"`.
  */
 export function buildDefaultSessionConfig(
 	config: RealtimeConnectConfig,
@@ -193,8 +259,14 @@ export function buildDefaultSessionConfig(
 	if (mode === "transcription") {
 		// No spoken assistant response in MVP — text modality keeps the plane quiet.
 		base.output_modalities = ["text"];
+		// Explicit empty tools so a live mode-switch clears conversational tools.
+		base.tools = [];
+		base.tool_choice = "none";
 	} else {
 		base.output_modalities = ["audio"];
+		base.instructions = CONVERSATIONAL_INSTRUCTIONS;
+		base.tools = [PI_TURN_TOOL];
+		base.tool_choice = "auto";
 	}
 
 	if (config.session) {
@@ -483,6 +555,60 @@ export class RealtimeClient implements RealtimeClientLike {
 		return this.#sessionConfig;
 	}
 
+	/**
+	 * Return a tool result to the Realtime conversation (VS8).
+	 * Caller should follow with {@link createResponse}.
+	 */
+	sendFunctionCallOutput(callId: string, output: string): void {
+		this.#send({
+			type: "conversation.item.create",
+			item: {
+				type: "function_call_output",
+				call_id: callId,
+				output,
+			},
+		});
+	}
+
+	/** Ask the model to generate a response (after tool output or manual turn). */
+	createResponse(response?: Record<string, unknown>): void {
+		if (response && Object.keys(response).length > 0) {
+			this.#send({ type: "response.create", response });
+		} else {
+			this.#send({ type: "response.create" });
+		}
+	}
+
+	/** Cancel an in-flight model response (barge-in / interrupt). */
+	cancelResponse(): void {
+		try {
+			this.#send({ type: "response.cancel" });
+		} catch {
+			// Not connected or no active response — ignore.
+		}
+	}
+
+	/**
+	 * Truncate unplayed assistant audio after a user barge-in (WebSocket path).
+	 * `audioEndMs` is how much of the item the user actually heard.
+	 */
+	truncateConversationItem(
+		itemId: string,
+		audioEndMs: number,
+		contentIndex = 0,
+	): void {
+		try {
+			this.#send({
+				type: "conversation.item.truncate",
+				item_id: itemId,
+				content_index: contentIndex,
+				audio_end_ms: Math.max(0, Math.floor(audioEndMs)),
+			});
+		} catch {
+			// ignore when disconnected
+		}
+	}
+
 	// ── internals ──────────────────────────────────────────────────────────
 
 	#emit(event: string, ...args: unknown[]): void {
@@ -606,6 +732,60 @@ export class RealtimeClient implements RealtimeClientLike {
 				this.#emit("speech.stopped", te);
 				break;
 			}
+			case "response.function_call_arguments.done": {
+				const name = typeof event.name === "string" ? event.name : "";
+				const callId =
+					typeof event.call_id === "string" ? event.call_id : "";
+				const args =
+					typeof event.arguments === "string" ? event.arguments : "{}";
+				if (!callId) break;
+				const fc: FunctionCallEvent = {
+					name,
+					callId,
+					arguments: args,
+					itemId:
+						typeof event.item_id === "string"
+							? event.item_id
+							: undefined,
+					timestamp: Date.now(),
+				};
+				this.#emit("function_call", fc);
+				break;
+			}
+			// GA name; keep beta alias for older gateways.
+			case "response.output_audio.delta":
+			case "response.audio.delta": {
+				const delta = typeof event.delta === "string" ? event.delta : "";
+				if (!delta) break;
+				this.#emit("audio.delta", {
+					delta,
+					itemId:
+						typeof event.item_id === "string"
+							? event.item_id
+							: undefined,
+					responseId:
+						typeof event.response_id === "string"
+							? event.response_id
+							: undefined,
+					timestamp: Date.now(),
+				} satisfies RealtimeAudioDeltaEvent);
+				break;
+			}
+			case "response.output_audio.done":
+			case "response.audio.done": {
+				this.#emit("audio.done", {
+					itemId:
+						typeof event.item_id === "string"
+							? event.item_id
+							: undefined,
+					responseId:
+						typeof event.response_id === "string"
+							? event.response_id
+							: undefined,
+					timestamp: Date.now(),
+				} satisfies RealtimeAudioDoneEvent);
+				break;
+			}
 			case "error": {
 				const err = event.error;
 				this.#emit("error", {
@@ -620,5 +800,6 @@ export class RealtimeClient implements RealtimeClientLike {
 				// Other events available via the "event" channel.
 				break;
 		}
+
 	}
 }

@@ -1,13 +1,16 @@
 /**
- * Voice session state machine (VS5–VS7 / issues #12–#14).
+ * Voice session state machine (VS5–VS8 / issues #12–#15).
  *
  * Wires auth + realtime client + mic capture + pi bridge into a working
  * transcription loop. VS6 adds optional speak-back via `playback.ts` on
  * `speakBack()`, coordinated with `setCapturePaused` for echo reduction.
  * VS7 adds transcript widget polish, prefs, reconnect / 60m session limit,
  * and a short post-TTS echo guard.
+ * VS8 adds conversational mode: Realtime audio out + narrow `pi_turn` tool
+ * that delegates coding to pi and returns function_call_output.
  *
- * Public hooks: onTranscript, onStateChange, setCapturePaused, applyPrefs.
+ * Public hooks: onTranscript, onStateChange, setCapturePaused, applyPrefs,
+ * setMode, notifyAgentSettled.
  *
  * State machine: idle → connecting → listening → stopping → idle (+ error)
  */
@@ -22,6 +25,7 @@ import {
 import { MicCapture } from "./capture.js";
 import { loadVoiceConfig, type VoiceConfig } from "./config.js";
 import {
+	PcmStreamPlayer,
 	VoicePlayback,
 	type SpawnFn,
 	type TtsBackend,
@@ -32,11 +36,14 @@ import {
 	type VoiceStatePrefs,
 } from "./prefs.js";
 import {
+	buildDefaultSessionConfig,
 	connectConfigFromVoice,
 	RealtimeClient,
+	type RealtimeAudioDeltaEvent,
 	type RealtimeClientError,
 } from "./realtime-client.js";
 import type {
+	FunctionCallEvent,
 	MicCaptureLike,
 	RealtimeClientLike,
 	TranscriptEvent,
@@ -131,6 +138,8 @@ const RECONNECT_BASE_DELAY_MS = 700;
  * connection limit. 55 minutes leaves headroom for auth + handshake.
  */
 const SESSION_LIMIT_REFRESH_MS = 55 * 60 * 1000;
+/** Max wait for pi agent_settled while handling a pi_turn tool call. */
+const PI_TURN_TIMEOUT_MS = 180_000;
 
 function errorMessage(err: unknown): string {
 	if (err instanceof VoiceAuthError) return err.message;
@@ -211,6 +220,16 @@ export class VoiceSession {
 	#echoGuardTimer: unknown;
 	#finalWidgetTimer: unknown;
 
+	/** Realtime PCM out (conversational mode). */
+	#pcmOut: PcmStreamPlayer;
+	/** Waiters for agent_settled during pi_turn. */
+	#settledWaiters: Array<{
+		resolve: (summary: string) => void;
+		gen: number;
+	}> = [];
+	/** In-flight pi_turn call ids (dedupe / status). */
+	#activePiTurns = 0;
+
 	readonly #stateHandlers = new Set<StateChangeHandler>();
 	readonly #transcriptHandlers = new Set<TranscriptHandler>();
 
@@ -248,6 +267,16 @@ export class VoiceSession {
 		this.#playback.onSpeakingChange((speaking) => {
 			this.#onSpeakingChange(speaking);
 		});
+		this.#pcmOut = new PcmStreamPlayer({
+			sampleRate: this.#config.sampleRate,
+			spawn: deps.spawn,
+		});
+		this.#pcmOut.onSpeakingChange((speaking) => {
+			// Realtime audio out also pauses capture (echo reduction).
+			if (this.#config.mode === "conversational") {
+				this.#onSpeakingChange(speaking);
+			}
+		});
 	}
 
 	/** Current lifecycle state. */
@@ -275,6 +304,9 @@ export class VoiceSession {
 		}
 		if (this.#speaking) {
 			return "speaking…";
+		}
+		if (this.#activePiTurns > 0) {
+			return "pi working…";
 		}
 		if (this.#state === "listening" && this.#capturePaused) {
 			// Distinguish agent-busy gate from TTS echo-guard hold-off.
@@ -360,7 +392,7 @@ export class VoiceSession {
 	 */
 	applyPrefs(prefs: VoiceStatePrefs): void {
 		if (prefs.mode !== undefined) {
-			this.#config = { ...this.#config, mode: prefs.mode as VoiceMode };
+			this.setMode(prefs.mode as VoiceMode);
 		}
 		if (prefs.tts !== undefined) {
 			const tts = prefs.tts as TtsBackend;
@@ -376,6 +408,54 @@ export class VoiceSession {
 				...this.#config,
 				inputDevice: prefs.inputDevice ?? undefined,
 			};
+		}
+	}
+
+	/**
+	 * Switch transcription ↔ conversational mode (VS8).
+	 * When live, pushes a session.update with the matching tools/modalities.
+	 * Default remains transcription.
+	 */
+	setMode(mode: VoiceMode): void {
+		if (mode !== "transcription" && mode !== "conversational") return;
+		if (this.#config.mode === mode) return;
+		this.#config = { ...this.#config, mode };
+		// Conversational uses Realtime audio out; stop leftover TTS.
+		if (mode === "conversational") {
+			this.#playback.stop();
+		} else {
+			this.#pcmOut.stop();
+		}
+		const client = this.#client;
+		if (client && this.isLive()) {
+			try {
+				const session = buildDefaultSessionConfig(
+					connectConfigFromVoice(this.#config),
+				);
+				client.updateSession(session);
+			} catch (err) {
+				this.#notify(
+					`voice mode update failed: ${errorMessage(err)}`,
+					"warning",
+				);
+			}
+		}
+		this.#pushUiStatus();
+	}
+
+	/**
+	 * Called from the extension on `agent_settled` so pi_turn can complete
+	 * with a function_call_output summary.
+	 */
+	notifyAgentSettled(summary?: string): void {
+		const text = (summary?.trim() || "done").slice(0, 2000);
+		const waiters = this.#settledWaiters.splice(0);
+		for (const w of waiters) {
+			try {
+				w.resolve(text);
+			} catch {
+				// ignore
+			}
 		}
 	}
 
@@ -433,7 +513,7 @@ export class VoiceSession {
 
 	/** Whether TTS speak-back is currently playing. */
 	isSpeaking(): boolean {
-		return this.#speaking;
+		return this.#speaking || this.#pcmOut.isSpeaking();
 	}
 
 	/**
@@ -442,6 +522,8 @@ export class VoiceSession {
 	 * Pauses capture while speaking to reduce echo.
 	 */
 	async speakBack(text: string): Promise<void> {
+		// Conversational mode: the Realtime model speaks after pi_turn output.
+		if (this.#config.mode === "conversational") return;
 		if (this.#config.tts === "off") return;
 		if (!this.isLive()) return;
 		const trimmed = text?.trim() ?? "";
@@ -454,9 +536,10 @@ export class VoiceSession {
 		}
 	}
 
-	/** Stop in-flight TTS without tearing down the session. */
+	/** Stop in-flight TTS / realtime audio without tearing down the session. */
 	stopPlayback(): void {
 		this.#playback.stop();
+		this.#pcmOut.stop();
 	}
 
 	/** Retain a UI handle for footer updates outside command handlers. */
@@ -630,6 +713,8 @@ export class VoiceSession {
 		this.#clearSessionLimitTimer();
 		this.#clearEchoGuardTimer();
 		this.#playback.stop();
+		this.#pcmOut.stop();
+		this.#rejectSettledWaiters("voice stopped");
 		this.#setState("stopping");
 		this.#pushUiStatus();
 		this.#pushPartialWidget();
@@ -760,8 +845,8 @@ export class VoiceSession {
 				this.#hearing = true;
 				this.#partial = "";
 				this.#clearEchoGuardTimer();
-				// Barge-in lite: stop speak-back when the user starts a new utterance.
-				this.#playback.stop();
+				// Barge-in: stop local playback + truncate Realtime audio out.
+				this.#bargeIn(client);
 				if (!this.#agentBusy && this.#state === "listening") {
 					this.setCapturePaused(false);
 				}
@@ -810,10 +895,32 @@ export class VoiceSession {
 			}
 		};
 
+		const onFunctionCall = (...args: unknown[]) => {
+			if (gen !== this.#generation) return;
+			const event = args[0] as FunctionCallEvent | undefined;
+			if (!event) return;
+			void this.#handleFunctionCall(event, gen);
+		};
+		const onAudioDelta = (...args: unknown[]) => {
+			if (gen !== this.#generation) return;
+			if (this.#config.mode !== "conversational") return;
+			const event = args[0] as RealtimeAudioDeltaEvent | undefined;
+			if (!event?.delta) return;
+			this.#pcmOut.appendBase64(event.delta, event.itemId);
+			this.#pushUiStatus();
+		};
+		const onAudioDone = (...args: unknown[]) => {
+			if (gen !== this.#generation) return;
+			this.#pcmOut.done();
+		};
+
 		sub("transcript.done", onDone);
 		sub("transcript.delta", onDelta);
 		sub("speech.started", onSpeech);
 		sub("speech.stopped", onSpeech);
+		sub("function_call", onFunctionCall);
+		sub("audio.delta", onAudioDelta);
+		sub("audio.done", onAudioDone);
 		sub("error", onError);
 		sub("close", onClose);
 		this.#unsubs = unsubs;
@@ -843,6 +950,11 @@ export class VoiceSession {
 	#handleFinalTranscript(event: TranscriptEvent): void {
 		const text = event.text?.trim() ?? "";
 		if (!text) return;
+
+		// Conversational: Realtime holds the dialogue; coding only via pi_turn.
+		if (this.#config.mode === "conversational") {
+			return;
+		}
 
 		const mode = this.#config.relayMode;
 		const target = this.#config.relayTarget?.trim();
@@ -899,6 +1011,162 @@ export class VoiceSession {
 			}
 		}
 		return !this.#agentBusy;
+	}
+
+	/**
+	 * Barge-in: stop local audio and truncate the Realtime assistant item.
+	 * Server VAD already cancels the in-progress response on speech_started;
+	 * we still send cancel + truncate for the WebSocket playback path.
+	 */
+	#bargeIn(client: RealtimeClientLike): void {
+		this.#playback.stop();
+		const { itemId, audioEndMs } = this.#pcmOut.stop();
+		try {
+			client.cancelResponse?.();
+		} catch {
+			// ignore
+		}
+		if (itemId && this.#config.mode === "conversational") {
+			try {
+				client.truncateConversationItem?.(itemId, audioEndMs, 0);
+			} catch {
+				// ignore
+			}
+		}
+	}
+
+	#rejectSettledWaiters(reason: string): void {
+		const waiters = this.#settledWaiters.splice(0);
+		for (const w of waiters) {
+			try {
+				w.resolve(`(interrupted: ${reason})`);
+			} catch {
+				// ignore
+			}
+		}
+	}
+
+	#waitAgentSettled(gen: number, timeoutMs = PI_TURN_TIMEOUT_MS): Promise<string> {
+		return new Promise((resolve) => {
+			let settled = false;
+			const entry = {
+				gen,
+				resolve: (summary: string) => {
+					if (settled) return;
+					settled = true;
+					this.#scheduler.clear(timer);
+					resolve(summary);
+				},
+			};
+			const timer = this.#scheduler.set(() => {
+				this.#settledWaiters = this.#settledWaiters.filter((w) => w !== entry);
+				entry.resolve("(pi turn timed out — agent still working)");
+			}, timeoutMs);
+			this.#settledWaiters.push(entry);
+			if (gen !== this.#generation) {
+				this.#settledWaiters = this.#settledWaiters.filter((w) => w !== entry);
+				entry.resolve("(session ended)");
+			}
+		});
+	}
+
+	async #handleFunctionCall(event: FunctionCallEvent, gen: number): Promise<void> {
+		if (gen !== this.#generation) return;
+		const name = event.name || "pi_turn";
+		if (name !== "pi_turn") {
+			this.#notify(`voice: ignoring unknown tool ${name}`, "warning");
+			this.#returnToolOutput(
+				event.callId,
+				JSON.stringify({
+					ok: false,
+					error: `unsupported tool: ${name}`,
+				}),
+			);
+			return;
+		}
+
+		let message = "";
+		try {
+			const parsed = JSON.parse(event.arguments || "{}") as {
+				message?: unknown;
+			};
+			message = typeof parsed.message === "string" ? parsed.message.trim() : "";
+		} catch {
+			message = "";
+		}
+
+		if (!message) {
+			this.#returnToolOutput(
+				event.callId,
+				JSON.stringify({ ok: false, error: "pi_turn requires message" }),
+			);
+			return;
+		}
+
+		this.#activePiTurns += 1;
+		this.#pushUiStatus();
+		this.#notify(`voice pi_turn → pi: ${truncate(message, 60)}`, "info");
+
+		const pi = this.#pi;
+		if (!pi) {
+			this.#activePiTurns = Math.max(0, this.#activePiTurns - 1);
+			this.#returnToolOutput(
+				event.callId,
+				JSON.stringify({
+					ok: false,
+					error: "no pi bridge bound — start voice inside pi",
+				}),
+			);
+			this.#pushUiStatus();
+			return;
+		}
+
+		// Register waiter before deliver to avoid missing a fast agent_settled.
+		const settledPromise = this.#waitAgentSettled(gen);
+		try {
+			// Steer while busy so conversational interrupts land promptly.
+			this.#deliverText(pi, message, {
+				isIdle: () => this.#probeIdle(),
+				whenBusy: "steer",
+			});
+		} catch (err) {
+			this.#activePiTurns = Math.max(0, this.#activePiTurns - 1);
+			this.notifyAgentSettled(`(bridge failed: ${errorMessage(err)})`);
+			this.#returnToolOutput(
+				event.callId,
+				JSON.stringify({
+					ok: false,
+					error: errorMessage(err),
+				}),
+			);
+			this.#pushUiStatus();
+			return;
+		}
+
+		const summary = await settledPromise;
+		if (gen !== this.#generation) return;
+		this.#activePiTurns = Math.max(0, this.#activePiTurns - 1);
+		this.#pushUiStatus();
+
+		const output = JSON.stringify({
+			ok: true,
+			summary: summarizeToolResult(summary),
+		});
+		this.#returnToolOutput(event.callId, output);
+	}
+
+	#returnToolOutput(callId: string, output: string): void {
+		const client = this.#client;
+		if (!client || !callId) return;
+		try {
+			client.sendFunctionCallOutput?.(callId, output);
+			client.createResponse?.();
+		} catch (err) {
+			this.#notify(
+				`voice tool output failed: ${errorMessage(err)}`,
+				"warning",
+			);
+		}
 	}
 
 	/**
@@ -1017,6 +1285,8 @@ export class VoiceSession {
 		this.#clearSessionLimitTimer();
 		this.#clearEchoGuardTimer();
 		this.#playback.stop();
+		this.#pcmOut.stop();
+		this.#rejectSettledWaiters(message);
 		const client = this.#client;
 		const capture = this.#capture;
 		this.#client = undefined;
@@ -1229,6 +1499,13 @@ export class VoiceSession {
 function truncate(text: string, max: number): string {
 	if (text.length <= max) return text;
 	return `${text.slice(0, Math.max(0, max - 1))}…`;
+}
+
+/** Keep function_call_output short for the voice model. */
+function summarizeToolResult(text: string, max = 800): string {
+	const t = text.replace(/\s+/g, " ").trim();
+	if (t.length <= max) return t;
+	return `${t.slice(0, max - 1)}…`;
 }
 
 function levelPct(level: number): string {
