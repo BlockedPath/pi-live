@@ -184,9 +184,7 @@ function makeSession(overrides?: {
 			delivered.push(text);
 			overrides?.deliver?.(text);
 		},
-		createPlayback: overrides?.playback
-			? () => overrides.playback!
-			: undefined,
+		createPlayback: overrides?.playback ? () => overrides.playback! : undefined,
 	});
 	session.bindUi(ui);
 

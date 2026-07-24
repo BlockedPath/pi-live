@@ -112,7 +112,10 @@ export function loadVoiceConfig(
 		sampleRate: parseSampleRate(env.PI_VOICE_SAMPLE_RATE?.trim()),
 		inputDevice: env.PI_VOICE_INPUT_DEVICE?.trim() || undefined,
 		relayTarget,
-		relayMode: parseRelayMode(env.PI_VOICE_RELAY_MODE?.trim(), Boolean(relayTarget)),
+		relayMode: parseRelayMode(
+			env.PI_VOICE_RELAY_MODE?.trim(),
+			Boolean(relayTarget),
+		),
 		apiKey: apiKey || undefined,
 	};
 }

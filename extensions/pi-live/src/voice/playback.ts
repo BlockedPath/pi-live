@@ -8,7 +8,11 @@
  *
  * Coordinates with session via capture pause (caller) and stop-on-barge-in.
  */
-import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import {
+	spawn,
+	type ChildProcess,
+	type SpawnOptions,
+} from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";

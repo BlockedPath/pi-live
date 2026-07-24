@@ -104,7 +104,10 @@ describe("extractLastAssistantText", () => {
 	});
 
 	it("returns empty when no assistant text", () => {
-		assert.equal(extractLastAssistantText([{ role: "user", content: "x" }]), "");
+		assert.equal(
+			extractLastAssistantText([{ role: "user", content: "x" }]),
+			"",
+		);
 		assert.equal(extractLastAssistantText([]), "");
 	});
 });

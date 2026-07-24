@@ -62,7 +62,8 @@ function formatVoiceStatus(): string {
 	if (info.inputDevice) parts.push(`in=${info.inputDevice}`);
 	if (info.captureBackend) parts.push(`backend=${info.captureBackend}`);
 	if (info.relayTarget) parts.push(`relay=${info.relayTarget}`);
-	if (info.relayMode && info.relayMode !== "local") parts.push(`relayMode=${info.relayMode}`);
+	if (info.relayMode && info.relayMode !== "local")
+		parts.push(`relayMode=${info.relayMode}`);
 	if (typeof info.audioChunks === "number") {
 		parts.push(`micChunks=${info.audioChunks}`);
 	}
@@ -176,7 +177,8 @@ export default function (pi: ExtensionAPI) {
 
 	// VS5+VS6: transcription MVP + optional speak-back.
 	pi.registerCommand("voice", {
-		description: "Voice: /voice [start|stop|status|toggle] (TTS via PI_VOICE_TTS)",
+		description:
+			"Voice: /voice [start|stop|status|toggle] (TTS via PI_VOICE_TTS)",
 		handler: async (args, ctx) => {
 			const { sub } = parseVoiceArgs(args);
 			const sessionRef = getSharedVoiceSession();
