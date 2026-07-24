@@ -109,8 +109,14 @@ Hands-free dictate → final transcript → `pi.sendUserMessage` → coding turn
 /voice toggle          # same as bare /voice
 ```
 
-Footer status (when UI is available): `voice: ● listening`,
-`voice: pi working…` (capture gated while the agent runs), etc.
+Footer status (when UI is available) updates live:
+- `voice: ● listening · waiting for mic…` — capture not producing chunks yet
+- `voice: ● listening · mic silent? (lvl 0%)` — chunks arrive but look like silence (wrong input device / muted)
+- `voice: ● listening · lvl 42%` — mic energy detected
+- `voice: hearing…` / `voice: hearing: <partial>` — server VAD + partial transcript
+- `voice: pi working…` — capture gated while the agent runs
+
+`/voice status` also prints `micChunks`, `lvl`, and any `partial`.
 
 ### Privacy
 

@@ -69,6 +69,14 @@ export interface VoiceSessionStatus {
 	sampleRate: number;
 	/** True when mic chunks are gated (e.g. while the agent is working). */
 	capturePaused?: boolean;
+	/** Server VAD currently detects speech. */
+	hearing?: boolean;
+	/** Latest partial transcript (may be empty). */
+	partial?: string;
+	/** Mic PCM chunks received since start (capture path alive). */
+	audioChunks?: number;
+	/** 0–1 rough input level from recent PCM (silence ≈ 0). */
+	audioLevel?: number;
 	/** Present when `state === "error"`. */
 	error?: string;
 }

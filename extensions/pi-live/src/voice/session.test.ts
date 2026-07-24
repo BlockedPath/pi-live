@@ -75,6 +75,15 @@ class FakeClient implements RealtimeClientLike {
 		this.#emit("transcript.done", event);
 	}
 
+	emitSpeech(kind: "started" | "stopped"): void {
+		const event: TranscriptEvent = {
+			type: kind === "started" ? "speech_started" : "speech_stopped",
+			text: "",
+			timestamp: Date.now(),
+		};
+		this.#emit(kind === "started" ? "speech.started" : "speech.stopped", event);
+	}
+
 	#emit(event: string, ...args: unknown[]): void {
 		const set = this.#listeners.get(event);
 		if (!set) return;
@@ -180,7 +189,7 @@ describe("VoiceSession", () => {
 		await session.start({ pi, isIdle: () => true });
 
 		assert.equal(session.getState(), "listening");
-		assert.equal(session.getStatus(), "● listening");
+		assert.match(session.getStatus(), /listening/);
 		assert.equal(session.getStatusInfo().authMode, "chatgpt");
 		assert.equal(client.connected, true);
 		assert.equal(capture.started, true);
@@ -197,18 +206,38 @@ describe("VoiceSession", () => {
 			pi: { sendUserMessage: () => undefined },
 		});
 
-		const chunk = new Uint8Array([1, 2, 3, 4]);
+		// Non-silent PCM16 sample (high amplitude).
+		const chunk = new Uint8Array(64);
+		for (let i = 0; i < 64; i += 2) {
+			chunk[i] = 0xff;
+			chunk[i + 1] = 0x7f; // ~32767 LE
+		}
 		capture.push(chunk);
 		assert.equal(client.appended.length, 1);
+		assert.ok((session.getStatusInfo().audioChunks ?? 0) >= 1);
+		assert.ok((session.getStatusInfo().audioLevel ?? 0) > 0);
+		assert.match(session.getStatus(), /listening/);
 
 		session.setCapturePaused(true);
 		assert.equal(session.getStatus(), "pi working…");
 		capture.push(chunk);
+		// Paused: still meters mic, does not stream.
 		assert.equal(client.appended.length, 1);
+		assert.ok((session.getStatusInfo().audioChunks ?? 0) >= 2);
 
 		session.setCapturePaused(false);
 		capture.push(chunk);
 		assert.equal(client.appended.length, 2);
+	});
+
+	it("shows hearing status on speech.started", async () => {
+		const { session, client } = makeSession();
+		await session.start({ pi: { sendUserMessage: () => undefined } });
+		client.emitSpeech("started");
+		assert.equal(session.getStatusInfo().hearing, true);
+		assert.match(session.getStatus(), /hearing/);
+		client.emitSpeech("stopped");
+		assert.equal(session.getStatusInfo().hearing, false);
 	});
 
 	it("delivers final transcripts via bridge", async () => {

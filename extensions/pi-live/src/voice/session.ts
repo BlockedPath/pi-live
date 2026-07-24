@@ -36,6 +36,8 @@ import type {
 export interface VoiceSessionUi {
 	notify(message: string, type?: "info" | "warning" | "error"): void;
 	setStatus?(key: string, text: string | undefined): void;
+	/** Optional one-line partial transcript widget above the editor. */
+	setWidget?(key: string, content: string[] | undefined): void;
 }
 
 /** Options accepted by {@link VoiceSession.start}. */
@@ -78,6 +80,11 @@ const LIVE_STATES: ReadonlySet<VoiceSessionState> = new Set([
 	"stopping",
 ]);
 
+/** PCM16 amplitude ≈ silence below this (int16 units, abs). */
+const SILENCE_ABS = 200;
+/** Throttle footer refreshes while streaming mic levels. */
+const LEVEL_UI_MIN_MS = 250;
+
 function errorMessage(err: unknown): string {
 	if (err instanceof VoiceAuthError) return err.message;
 	if (err instanceof Error) return err.message;
@@ -106,6 +113,17 @@ export class VoiceSession {
 	#pi: VoiceBridgePi | undefined;
 	#isIdle: (() => boolean) | undefined;
 	#ui: VoiceSessionUi | undefined;
+
+	/** Server VAD: user is currently speaking. */
+	#hearing = false;
+	/** Accumulated partial transcript for the current utterance. */
+	#partial = "";
+	/** Mic chunks observed since last start (proves capture path). */
+	#audioChunks = 0;
+	/** Smoothed 0–1 level from recent PCM. */
+	#audioLevel = 0;
+	#lastLevelUiAt = 0;
+	#hadAudible = false;
 
 	readonly #stateHandlers = new Set<StateChangeHandler>();
 	readonly #transcriptHandlers = new Set<TranscriptHandler>();
@@ -145,7 +163,20 @@ export class VoiceSession {
 			return "pi working…";
 		}
 		if (this.#state === "listening") {
-			return "● listening";
+			const partial = this.#partial.trim();
+			if (partial) {
+				return `hearing: ${truncate(partial, 48)}`;
+			}
+			if (this.#hearing) {
+				return "hearing…";
+			}
+			if (this.#audioChunks === 0) {
+				return "● listening · waiting for mic…";
+			}
+			if (!this.#hadAudible) {
+				return `● listening · mic silent? (lvl ${levelPct(this.#audioLevel)})`;
+			}
+			return `● listening · lvl ${levelPct(this.#audioLevel)}`;
 		}
 		if (this.#state === "connecting") {
 			return "connecting…";
@@ -168,6 +199,10 @@ export class VoiceSession {
 			voice: this.#config.voice,
 			sampleRate: this.#config.sampleRate,
 			capturePaused: this.#capturePaused,
+			hearing: this.#hearing,
+			partial: this.#partial || undefined,
+			audioChunks: this.#audioChunks,
+			audioLevel: this.#audioLevel,
 			error: this.#error,
 		};
 	}
@@ -259,6 +294,7 @@ export class VoiceSession {
 		this.#error = undefined;
 		this.#authMode = undefined;
 		this.#capturePaused = false;
+		this.#resetHearingState();
 		this.#setState("connecting");
 		this.#pushUiStatus();
 
@@ -292,6 +328,8 @@ export class VoiceSession {
 			await capture.start((pcm) => {
 				if (gen !== this.#generation) return;
 				if (this.#state !== "listening") return;
+				// Always sample mic health (even while paused).
+				this.#noteAudio(pcm);
 				if (this.#capturePaused) return;
 				const active = this.#client;
 				if (!active) return;
@@ -312,7 +350,7 @@ export class VoiceSession {
 
 			this.#setState("listening");
 			this.#notify(
-				`voice listening (${auth.mode} · ${this.#config.mode})`,
+				`voice listening (${auth.mode} · ${this.#config.mode}) — speak anytime; footer shows hearing/partials`,
 				"info",
 			);
 			this.#pushUiStatus();
@@ -325,6 +363,7 @@ export class VoiceSession {
 			await this.#teardownResources(client, capture);
 			this.#authMode = undefined;
 			this.#capturePaused = false;
+			this.#resetHearingState();
 			this.#error = message;
 			this.#setState("error");
 			this.#notify(`voice error: ${message}`, "error");
@@ -361,6 +400,7 @@ export class VoiceSession {
 
 		this.#authMode = undefined;
 		this.#capturePaused = false;
+		this.#resetHearingState();
 		this.#error = undefined;
 		this.#setState("idle");
 		this.#notify("voice stopped", "info");
@@ -404,18 +444,45 @@ export class VoiceSession {
 			if (gen !== this.#generation) return;
 			const event = args[0] as TranscriptEvent | undefined;
 			if (!event) return;
+			this.#hearing = false;
+			this.#partial = "";
 			this.#emitTranscript(event);
 			this.#handleFinalTranscript(event);
+			this.#pushUiStatus();
+			this.#pushPartialWidget();
 		};
 		const onDelta = (...args: unknown[]) => {
 			if (gen !== this.#generation) return;
 			const event = args[0] as TranscriptEvent | undefined;
-			if (event) this.#emitTranscript(event);
+			if (!event) return;
+			// Deltas are incremental; accumulate for the footer line.
+			const piece = event.text ?? "";
+			if (piece) {
+				this.#partial = `${this.#partial}${piece}`;
+				this.#hearing = true;
+			}
+			this.#emitTranscript({
+				...event,
+				text: this.#partial,
+			});
+			this.#pushUiStatus();
+			this.#pushPartialWidget();
 		};
 		const onSpeech = (...args: unknown[]) => {
 			if (gen !== this.#generation) return;
 			const event = args[0] as TranscriptEvent | undefined;
-			if (event) this.#emitTranscript(event);
+			if (!event) return;
+			if (event.type === "speech_started") {
+				this.#hearing = true;
+				this.#partial = "";
+				this.#notify("voice: hearing you…", "info");
+			} else if (event.type === "speech_stopped") {
+				this.#hearing = false;
+				// Keep partial until final arrives.
+			}
+			this.#emitTranscript(event);
+			this.#pushUiStatus();
+			this.#pushPartialWidget();
 		};
 		const onError = (...args: unknown[]) => {
 			if (gen !== this.#generation) return;
@@ -430,7 +497,9 @@ export class VoiceSession {
 			if (gen !== this.#generation) return;
 			// Unexpected close while live → surface and reset.
 			if (this.#state === "listening" || this.#state === "connecting") {
-				const info = args[0] as { code?: number; reason?: string } | undefined;
+				const info = args[0] as
+					| { code?: number; reason?: string }
+					| undefined;
 				const reason = info?.reason?.trim();
 				const message = reason
 					? `connection closed (${info?.code ?? "?"}: ${reason})`
@@ -523,6 +592,7 @@ export class VoiceSession {
 		this.#error = message;
 		this.#authMode = undefined;
 		this.#capturePaused = false;
+		this.#resetHearingState();
 		this.#setState("error");
 		this.#notify(`voice error: ${message}`, "error");
 		this.#pushUiStatus();
@@ -558,6 +628,48 @@ export class VoiceSession {
 		}
 	}
 
+	#resetHearingState(): void {
+		this.#hearing = false;
+		this.#partial = "";
+		this.#audioChunks = 0;
+		this.#audioLevel = 0;
+		this.#lastLevelUiAt = 0;
+		this.#hadAudible = false;
+		this.#pushPartialWidget(true);
+	}
+
+	#noteAudio(pcm: Uint8Array): void {
+		this.#audioChunks += 1;
+		const level = pcmLevel01(pcm);
+		// Light EMA so the footer isn't jumpy.
+		this.#audioLevel = this.#audioLevel * 0.7 + level * 0.3;
+		if (level > 0.02) this.#hadAudible = true;
+		const now = Date.now();
+		if (now - this.#lastLevelUiAt >= LEVEL_UI_MIN_MS) {
+			this.#lastLevelUiAt = now;
+			// Only refresh footer for levels when not already showing speech text.
+			if (!this.#hearing && !this.#partial) {
+				this.#pushUiStatus();
+			}
+		}
+	}
+
+	#pushPartialWidget(clear = false): void {
+		const ui = this.#ui;
+		if (!ui?.setWidget) return;
+		try {
+			if (clear || !this.#partial.trim()) {
+				ui.setWidget("voice-partial", undefined);
+				return;
+			}
+			ui.setWidget("voice-partial", [
+				`voice ▸ ${truncate(this.#partial.trim(), 100)}`
+			]);
+		} catch {
+			// UI optional
+		}
+	}
+
 	/**
 	 * Push footer status. When `clear` is set and state is idle, remove the key.
 	 */
@@ -567,6 +679,7 @@ export class VoiceSession {
 		try {
 			if (clear && this.#state === "idle") {
 				ui.setStatus("voice", undefined);
+				this.#pushPartialWidget(true);
 				return;
 			}
 			ui.setStatus("voice", `voice: ${this.getStatus()}`);
@@ -575,10 +688,29 @@ export class VoiceSession {
 		}
 	}
 }
-
 function truncate(text: string, max: number): string {
 	if (text.length <= max) return text;
 	return `${text.slice(0, Math.max(0, max - 1))}…`;
+}
+
+function levelPct(level: number): string {
+	const pct = Math.max(0, Math.min(100, Math.round(level * 100)));
+	return `${pct}%`;
+}
+
+/** Rough 0–1 peak level from PCM16 LE mono bytes. */
+function pcmLevel01(pcm: Uint8Array): number {
+	if (pcm.byteLength < 2) return 0;
+	const view = new DataView(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+	let peak = 0;
+	// Subsample for cheap metering.
+	const step = Math.max(2, Math.floor(pcm.byteLength / 64) * 2);
+	for (let i = 0; i + 1 < pcm.byteLength; i += step) {
+		const s = Math.abs(view.getInt16(i, true));
+		if (s > peak) peak = s;
+	}
+	if (peak < SILENCE_ABS) return 0;
+	return Math.min(1, peak / 32768);
 }
 
 /** Process-wide session for the `/voice` command. */

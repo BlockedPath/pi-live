@@ -51,18 +51,45 @@ function formatVoiceStatus(): string {
 		`sampleRate=${info.sampleRate}`,
 	);
 	if (info.capturePaused) parts.push("capture=paused");
+	if (info.hearing) parts.push("hearing=yes");
+	if (typeof info.audioChunks === "number") {
+		parts.push(`micChunks=${info.audioChunks}`);
+	}
+	if (typeof info.audioLevel === "number") {
+		parts.push(`lvl=${Math.round(info.audioLevel * 100)}%`);
+	}
+	if (info.partial) parts.push(`partial=${JSON.stringify(info.partial)}`);
 	if (info.error) parts.push(`error=${info.error}`);
 	return parts.join(" · ");
+}
+
+function voiceUiFromCtx(ctx: {
+	ui: {
+		notify: (message: string, type?: "info" | "warning" | "error") => void;
+		setStatus?(key: string, text: string | undefined): void;
+		setWidget?(key: string, content: string[] | undefined): void;
+	};
+}): {
+	notify: (message: string, type?: "info" | "warning" | "error") => void;
+	setStatus?(key: string, text: string | undefined): void;
+	setWidget?(key: string, content: string[] | undefined): void;
+} {
+	return {
+		notify: (message, type) => ctx.ui.notify(message, type),
+		setStatus: ctx.ui.setStatus?.bind(ctx.ui),
+		setWidget: ctx.ui.setWidget?.bind(ctx.ui),
+	};
 }
 
 function reportVoiceStatus(ctx: {
 	ui: {
 		notify: (message: string, type?: "info" | "warning" | "error") => void;
 		setStatus?(key: string, text: string | undefined): void;
+		setWidget?(key: string, content: string[] | undefined): void;
 	};
 }): void {
 	const session = getSharedVoiceSession();
-	session.bindUi(ctx.ui);
+	session.bindUi(voiceUiFromCtx(ctx));
 	const line = formatVoiceStatus();
 	// Footer when available; always notify so the command is visible.
 	ctx.ui.setStatus?.("voice", `voice: ${session.getStatus()}`);
@@ -83,19 +110,19 @@ export default function (pi: ExtensionAPI) {
 
 	// Surface a small note when a session starts so you can see the extension load.
 	pi.on("session_start", async (_event, ctx) => {
-		session.bindUi(ctx.ui);
+		session.bindUi(voiceUiFromCtx(ctx));
 		ctx.ui.notify("pi-live extension loaded", "info");
 	});
 
 	// Gate mic while the agent is working to cut keyboard/speaker noise.
 	pi.on("agent_start", async (_event, ctx) => {
-		session.bindUi(ctx.ui);
+		session.bindUi(voiceUiFromCtx(ctx));
 		session.setAgentBusy(true);
 	});
 
 	// Resume capture once the agent has fully settled.
 	pi.on("agent_settled", async (_event, ctx) => {
-		session.bindUi(ctx.ui);
+		session.bindUi(voiceUiFromCtx(ctx));
 		session.setAgentBusy(false);
 	});
 
@@ -127,12 +154,13 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const { sub } = parseVoiceArgs(args);
 			const sessionRef = getSharedVoiceSession();
-			sessionRef.bindUi(ctx.ui);
+			const ui = voiceUiFromCtx(ctx);
+			sessionRef.bindUi(ui);
 
 			const startOpts = {
 				pi,
 				isIdle: () => ctx.isIdle(),
-				ui: ctx.ui,
+				ui,
 			};
 
 			try {
