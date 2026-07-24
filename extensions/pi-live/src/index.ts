@@ -1,6 +1,7 @@
 /**
  * pi-live extension — demo skeleton + voice transcription MVP (VS5 / #12)
- * with optional speak-back (VS6 / #13) and UX polish (VS7 / #14).
+ * with optional speak-back (VS6 / #13), UX polish (VS7 / #14), and
+ * conversational mode + pi_turn (VS8 / #15).
  *
  * Install locally (one of):
  *   - `cd extensions/pi-live && pi install .`
@@ -181,13 +182,16 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// Resume capture once the agent has fully settled; optional speak-back.
+	// Conversational pi_turn waits on this via session.notifyAgentSettled.
 	pi.on("agent_settled", async (_event, ctx) => {
 		session.bindUi(voiceUiFromCtx(ctx));
 		session.setAgentBusy(false);
 		const text = pendingSpeakText;
 		pendingSpeakText = "";
+		// Unblock any in-flight pi_turn tool handler first.
+		session.notifyAgentSettled(text || "done");
 		if (text && session.isLive()) {
-			// Fire-and-forget so other extensions are not blocked on TTS.
+			// Transcription mode only — conversational uses Realtime audio out.
 			void session.speakBack(text);
 		}
 	});
@@ -252,7 +256,7 @@ export default function (pi: ExtensionAPI) {
 	// VS5+VS6+VS7: transcription MVP + speak-back + polish.
 	pi.registerCommand("voice", {
 		description:
-			"Voice: /voice [start|stop|status|toggle] · shortcut ctrl+shift+v",
+			"Voice: /voice [start|stop|status|toggle|mode] · shortcut ctrl+shift+v",
 		handler: async (args, ctx) => {
 			const { sub } = parseVoiceArgs(args);
 			const sessionRef = getSharedVoiceSession();
@@ -272,6 +276,11 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				if (sub === "start") {
+					const { rest } = parseVoiceArgs(args);
+					const modeArg = (rest[0] ?? "").toLowerCase();
+					if (modeArg === "transcription" || modeArg === "conversational") {
+						sessionRef.setMode(modeArg);
+					}
 					await sessionRef.start(startOpts);
 					persistVoicePrefs(pi);
 					// start already notifies; refresh detailed status line
@@ -297,17 +306,32 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
-				// Mode switch is reserved for conversational (#15); acknowledge politely.
 				if (sub === "mode") {
+					const { rest } = parseVoiceArgs(args);
+					const next = (rest[0] ?? "").toLowerCase();
+					if (next !== "transcription" && next !== "conversational") {
+						ctx.ui.notify(
+							`Usage: /voice mode transcription|conversational (current=${sessionRef.getConfig().mode})`,
+							"warning",
+						);
+						return;
+					}
+					const prev = sessionRef.getConfig().mode;
+					sessionRef.setMode(next);
+					persistVoicePrefs(pi);
+					const live = sessionRef.isLive() ? " (applied to live session)" : "";
 					ctx.ui.notify(
-						`/voice mode is not available yet (conversational lands in #15). Current mode=${sessionRef.getConfig().mode}.`,
-						"warning",
+						prev === next
+							? `voice mode already ${next}`
+							: `voice mode ${prev} → ${next}${live}`,
+						"info",
 					);
+					reportVoiceStatus(ctx);
 					return;
 				}
 
 				ctx.ui.notify(
-					`Unknown /voice subcommand "${sub}". Try start|stop|status|toggle (or ctrl+shift+v).`,
+					`Unknown /voice subcommand "${sub}". Try start|stop|status|toggle|mode (or ctrl+shift+v).`,
 					"warning",
 				);
 			} catch (err) {

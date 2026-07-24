@@ -12,7 +12,7 @@ import type { VoiceAuthPrefer, VoiceMode } from "./types.js";
 export type VoiceRelayMode = "local" | "relay" | "both";
 
 export interface VoiceConfig {
-	/** `transcription` (MVP) or `conversational` (later). */
+	/** `transcription` (default) or `conversational` (VS8 pi_turn). */
 	mode: VoiceMode;
 	/** Realtime model id, e.g. `gpt-realtime-2.1`. */
 	model: string;

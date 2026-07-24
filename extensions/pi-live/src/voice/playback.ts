@@ -466,3 +466,234 @@ export class VoicePlayback {
 		}
 	}
 }
+
+
+/**
+ * Realtime assistant PCM playback (VS8 conversational).
+ *
+ * Buffers PCM16 deltas for the current assistant item, then plays a WAV via
+ * `afplay`/`ffplay` so sentences complete without sox underrun glitches.
+ * `stop()` aborts immediately (discards buffer / kills player) for barge-in.
+ * Speaker-echo barge-in is filtered in session.ts — this class just plays/stops.
+ */
+export interface PcmStreamPlayerOptions {
+	sampleRate?: number;
+	spawn?: SpawnFn;
+}
+
+function writeWavPcm16Mono(pcm: Buffer, sampleRate: number): Buffer {
+	const dataSize = pcm.byteLength;
+	const header = Buffer.alloc(44);
+	header.write("RIFF", 0);
+	header.writeUInt32LE(36 + dataSize, 4);
+	header.write("WAVE", 8);
+	header.write("fmt ", 12);
+	header.writeUInt32LE(16, 16);
+	header.writeUInt16LE(1, 20);
+	header.writeUInt16LE(1, 22);
+	header.writeUInt32LE(sampleRate, 24);
+	header.writeUInt32LE(sampleRate * 2, 28);
+	header.writeUInt16LE(2, 32);
+	header.writeUInt16LE(16, 34);
+	header.write("data", 36);
+	header.writeUInt32LE(dataSize, 40);
+	return Buffer.concat([header, pcm]);
+}
+
+export class PcmStreamPlayer {
+	readonly #sampleRate: number;
+	readonly #spawn: SpawnFn;
+	readonly #handlers = new Set<SpeakingHandler>();
+
+	#child: ChildProcess | undefined;
+	#chunks: Buffer[] = [];
+	#bytesWritten = 0;
+	#itemId: string | undefined;
+	#speaking = false;
+	#generation = 0;
+	#hasAudio = false;
+	#playFile: string | undefined;
+	#playing = false;
+
+	constructor(options: PcmStreamPlayerOptions = {}) {
+		this.#sampleRate = options.sampleRate ?? 24_000;
+		this.#spawn = options.spawn ?? defaultSpawn;
+	}
+
+	isSpeaking(): boolean {
+		return this.#speaking || this.#playing;
+	}
+
+	hasAudio(): boolean {
+		return this.#hasAudio || this.#speaking || this.#playing || Boolean(this.#itemId);
+	}
+
+	getPlayedMs(): number {
+		const samples = Math.floor(this.#bytesWritten / 2);
+		return Math.floor((samples * 1000) / this.#sampleRate);
+	}
+
+	getCurrentItemId(): string | undefined {
+		return this.#itemId;
+	}
+
+	onSpeakingChange(handler: SpeakingHandler): () => void {
+		this.#handlers.add(handler);
+		return () => {
+			this.#handlers.delete(handler);
+		};
+	}
+
+	/** Accept a base64 PCM16 chunk for the current assistant item. */
+	appendBase64(delta: string, itemId?: string): void {
+		if (!delta) return;
+		let buf: Buffer;
+		try {
+			buf = Buffer.from(delta, "base64");
+		} catch {
+			return;
+		}
+		if (buf.byteLength === 0) return;
+
+		if (itemId && this.#itemId && itemId !== this.#itemId) {
+			// New item — finish/stop prior playback first.
+			this.stop();
+		}
+		if (itemId) this.#itemId = itemId;
+
+		this.#hasAudio = true;
+		this.#chunks.push(buf);
+		this.#bytesWritten += buf.byteLength;
+		// "Speaking" from first chunk so capture pauses / UI updates even
+		// while we buffer toward a clean full-utterance play.
+		this.#setSpeaking(true);
+	}
+
+	/** Server finished this audio segment — play the buffered PCM cleanly. */
+	done(): void {
+		const gen = this.#generation;
+		const pcm = Buffer.concat(this.#chunks);
+		this.#chunks = [];
+		if (pcm.byteLength < 4) {
+			this.#setSpeaking(false);
+			return;
+		}
+		void this.#playWav(pcm, gen);
+	}
+
+	/**
+	 * Abort immediately (barge-in). Drops undelivered PCM and kills player.
+	 */
+	stop(): { itemId?: string; audioEndMs: number } {
+		const itemId = this.#itemId;
+		const audioEndMs = this.getPlayedMs();
+		this.#generation++;
+		const child = this.#child;
+		const file = this.#playFile;
+		this.#child = undefined;
+		this.#playFile = undefined;
+		this.#chunks = [];
+		this.#bytesWritten = 0;
+		this.#itemId = undefined;
+		this.#hasAudio = false;
+		this.#playing = false;
+
+		if (child) {
+			try {
+				const stdin = child.stdin;
+				if (stdin && !stdin.destroyed) {
+					stdin.removeAllListeners("error");
+					stdin.on("error", () => undefined);
+					try {
+						stdin.destroy();
+					} catch {
+						// ignore
+					}
+				}
+			} catch {
+				// ignore
+			}
+			try {
+				if (!child.killed) child.kill("SIGKILL");
+			} catch {
+				// ignore
+			}
+			try {
+				child.removeAllListeners();
+			} catch {
+				// ignore
+			}
+		}
+		if (file) {
+			void unlink(file).catch(() => undefined);
+		}
+		this.#setSpeaking(false);
+		return { itemId, audioEndMs };
+	}
+
+	async #playWav(pcm: Buffer, gen: number): Promise<void> {
+		if (gen !== this.#generation) return;
+
+		const wav = writeWavPcm16Mono(pcm, this.#sampleRate);
+		const file = join(
+			tmpdir(),
+			`pi-voice-rt-${randomBytes(8).toString("hex")}.wav`,
+		);
+		try {
+			await writeFile(file, wav);
+		} catch {
+			if (gen === this.#generation) this.#setSpeaking(false);
+			return;
+		}
+		if (gen !== this.#generation) {
+			await unlink(file).catch(() => undefined);
+			return;
+		}
+
+		const player = platform() === "darwin" ? "afplay" : "ffplay";
+		const args =
+			player === "afplay"
+				? [file]
+				: ["-nodisp", "-autoexit", "-loglevel", "quiet", file];
+
+		try {
+			const child = this.#spawn(player, args, {
+				stdio: "ignore",
+				env: process.env,
+			});
+			this.#child = child;
+			this.#playFile = file;
+			this.#playing = true;
+			this.#setSpeaking(true);
+
+			await new Promise<void>((resolve) => {
+				const finish = () => resolve();
+				child.on("error", finish);
+				child.on("close", finish);
+			});
+		} catch {
+			// player missing
+		} finally {
+			if (gen === this.#generation) {
+				this.#child = undefined;
+				this.#playFile = undefined;
+				this.#playing = false;
+				this.#hasAudio = false;
+				this.#setSpeaking(false);
+			}
+			await unlink(file).catch(() => undefined);
+		}
+	}
+
+	#setSpeaking(next: boolean): void {
+		if (this.#speaking === next) return;
+		this.#speaking = next;
+		for (const handler of this.#handlers) {
+			try {
+				handler(next);
+			} catch {
+				// ignore
+			}
+		}
+	}
+}

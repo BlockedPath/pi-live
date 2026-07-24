@@ -1,13 +1,16 @@
 /**
- * Voice session state machine (VS5–VS7 / issues #12–#14).
+ * Voice session state machine (VS5–VS8 / issues #12–#15).
  *
  * Wires auth + realtime client + mic capture + pi bridge into a working
  * transcription loop. VS6 adds optional speak-back via `playback.ts` on
  * `speakBack()`, coordinated with `setCapturePaused` for echo reduction.
  * VS7 adds transcript widget polish, prefs, reconnect / 60m session limit,
  * and a short post-TTS echo guard.
+ * VS8 adds conversational mode: Realtime audio out + narrow `pi_turn` tool
+ * that delegates coding to pi and returns function_call_output.
  *
- * Public hooks: onTranscript, onStateChange, setCapturePaused, applyPrefs.
+ * Public hooks: onTranscript, onStateChange, setCapturePaused, applyPrefs,
+ * setMode, notifyAgentSettled.
  *
  * State machine: idle → connecting → listening → stopping → idle (+ error)
  */
@@ -22,6 +25,7 @@ import {
 import { MicCapture } from "./capture.js";
 import { loadVoiceConfig, type VoiceConfig } from "./config.js";
 import {
+	PcmStreamPlayer,
 	VoicePlayback,
 	type SpawnFn,
 	type TtsBackend,
@@ -32,11 +36,14 @@ import {
 	type VoiceStatePrefs,
 } from "./prefs.js";
 import {
+	buildDefaultSessionConfig,
 	connectConfigFromVoice,
 	RealtimeClient,
+	type RealtimeAudioDeltaEvent,
 	type RealtimeClientError,
 } from "./realtime-client.js";
 import type {
+	FunctionCallEvent,
 	MicCaptureLike,
 	RealtimeClientLike,
 	TranscriptEvent,
@@ -131,6 +138,17 @@ const RECONNECT_BASE_DELAY_MS = 700;
  * connection limit. 55 minutes leaves headroom for auth + handshake.
  */
 const SESSION_LIMIT_REFRESH_MS = 55 * 60 * 1000;
+/** Max wait for pi agent_settled while handling a pi_turn tool call. */
+const PI_TURN_TIMEOUT_MS = 180_000;
+/**
+ * Min mic level (0–1) for local barge-in while the assistant is talking.
+ * Tuned below typical close-talk speech; echo floor is tracked separately.
+ */
+const BARGE_IN_LEVEL = 0.04;
+/** Ignore barge-in this long after assistant audio begins (echo settle). */
+const BARGE_IN_GRACE_MS = 280;
+/** Consecutive loud capture ticks required before cutting the assistant. */
+const BARGE_IN_SUSTAIN = 3;
 
 function errorMessage(err: unknown): string {
 	if (err instanceof VoiceAuthError) return err.message;
@@ -211,6 +229,26 @@ export class VoiceSession {
 	#echoGuardTimer: unknown;
 	#finalWidgetTimer: unknown;
 
+	/** Realtime PCM out (conversational mode). */
+	#pcmOut: PcmStreamPlayer;
+	/** Waiters for agent_settled during pi_turn. */
+	#settledWaiters: Array<{
+		resolve: (summary: string) => void;
+		gen: number;
+	}> = [];
+	/** In-flight pi_turn call ids (dedupe / status). */
+	#activePiTurns = 0;
+	/** Realtime model response currently in flight (audio / tools). */
+	#responseActive = false;
+	/** Latest assistant item id for truncate on barge-in. */
+	#assistantItemId: string | undefined;
+	/** Date.now() when assistant audio last started (echo grace). */
+	#assistantAudioAt = 0;
+	/** Mic level baseline sampled as assistant audio starts (echo reference). */
+	#echoFloor = 0;
+	/** Sustained loud ticks while assistant is hot (local barge-in). */
+	#bargeLoudTicks = 0;
+
 	readonly #stateHandlers = new Set<StateChangeHandler>();
 	readonly #transcriptHandlers = new Set<TranscriptHandler>();
 
@@ -248,6 +286,16 @@ export class VoiceSession {
 		this.#playback.onSpeakingChange((speaking) => {
 			this.#onSpeakingChange(speaking);
 		});
+		this.#pcmOut = new PcmStreamPlayer({
+			sampleRate: this.#config.sampleRate,
+			spawn: deps.spawn,
+		});
+		this.#pcmOut.onSpeakingChange((speaking) => {
+			// Realtime audio out also pauses capture (echo reduction).
+			if (this.#config.mode === "conversational") {
+				this.#onSpeakingChange(speaking);
+			}
+		});
 	}
 
 	/** Current lifecycle state. */
@@ -273,8 +321,16 @@ export class VoiceSession {
 		if (this.#reconnecting) {
 			return `reconnecting (${this.#reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})…`;
 		}
-		if (this.#speaking) {
-			return "speaking…";
+		if (this.#speaking || this.#pcmOut.isSpeaking()) {
+			return this.#config.mode === "conversational"
+				? "speaking (realtime)…"
+				: "speaking…";
+		}
+		if (this.#responseActive && this.#config.mode === "conversational") {
+			return "assistant…";
+		}
+		if (this.#activePiTurns > 0) {
+			return "pi working…";
 		}
 		if (this.#state === "listening" && this.#capturePaused) {
 			// Distinguish agent-busy gate from TTS echo-guard hold-off.
@@ -360,7 +416,7 @@ export class VoiceSession {
 	 */
 	applyPrefs(prefs: VoiceStatePrefs): void {
 		if (prefs.mode !== undefined) {
-			this.#config = { ...this.#config, mode: prefs.mode as VoiceMode };
+			this.setMode(prefs.mode as VoiceMode);
 		}
 		if (prefs.tts !== undefined) {
 			const tts = prefs.tts as TtsBackend;
@@ -376,6 +432,54 @@ export class VoiceSession {
 				...this.#config,
 				inputDevice: prefs.inputDevice ?? undefined,
 			};
+		}
+	}
+
+	/**
+	 * Switch transcription ↔ conversational mode (VS8).
+	 * When live, pushes a session.update with the matching tools/modalities.
+	 * Default remains transcription.
+	 */
+	setMode(mode: VoiceMode): void {
+		if (mode !== "transcription" && mode !== "conversational") return;
+		if (this.#config.mode === mode) return;
+		this.#config = { ...this.#config, mode };
+		// Conversational uses Realtime audio out; stop leftover TTS.
+		if (mode === "conversational") {
+			this.#playback.stop();
+		} else {
+			this.#pcmOut.stop();
+		}
+		const client = this.#client;
+		if (client && this.isLive()) {
+			try {
+				const session = buildDefaultSessionConfig(
+					connectConfigFromVoice(this.#config),
+				);
+				client.updateSession(session);
+			} catch (err) {
+				this.#notify(
+					`voice mode update failed: ${errorMessage(err)}`,
+					"warning",
+				);
+			}
+		}
+		this.#pushUiStatus();
+	}
+
+	/**
+	 * Called from the extension on `agent_settled` so pi_turn can complete
+	 * with a function_call_output summary.
+	 */
+	notifyAgentSettled(summary?: string): void {
+		const text = (summary?.trim() || "done").slice(0, 2000);
+		const waiters = this.#settledWaiters.splice(0);
+		for (const w of waiters) {
+			try {
+				w.resolve(text);
+			} catch {
+				// ignore
+			}
 		}
 	}
 
@@ -433,7 +537,7 @@ export class VoiceSession {
 
 	/** Whether TTS speak-back is currently playing. */
 	isSpeaking(): boolean {
-		return this.#speaking;
+		return this.#speaking || this.#pcmOut.isSpeaking();
 	}
 
 	/**
@@ -442,6 +546,8 @@ export class VoiceSession {
 	 * Pauses capture while speaking to reduce echo.
 	 */
 	async speakBack(text: string): Promise<void> {
+		// Conversational mode: the Realtime model speaks after pi_turn output.
+		if (this.#config.mode === "conversational") return;
 		if (this.#config.tts === "off") return;
 		if (!this.isLive()) return;
 		const trimmed = text?.trim() ?? "";
@@ -454,9 +560,10 @@ export class VoiceSession {
 		}
 	}
 
-	/** Stop in-flight TTS without tearing down the session. */
+	/** Stop in-flight TTS / realtime audio without tearing down the session. */
 	stopPlayback(): void {
 		this.#playback.stop();
+		this.#pcmOut.stop();
 	}
 
 	/** Retain a UI handle for footer updates outside command handlers. */
@@ -552,8 +659,17 @@ export class VoiceSession {
 				// Meter whenever capture is alive (including connecting).
 				this.#noteAudio(pcm);
 				if (this.#state !== "listening") return;
-				if (this.#capturePaused) return;
 				const active = this.#client;
+				// Local barge-in: while assistant audio plays we pause the uplink
+				// (echo), so the server never sees speech_started — detect from mic energy.
+				if (
+					active &&
+					this.#config.mode === "conversational" &&
+					this.#assistantIsHot()
+				) {
+					this.#maybeLocalBargeIn(active);
+				}
+				if (this.#capturePaused) return;
 				if (!active) return;
 				try {
 					active.appendAudio(pcm);
@@ -585,8 +701,12 @@ export class VoiceSession {
 			const deviceNote = this.#config.inputDevice
 				? ` · in=${this.#config.inputDevice}`
 				: "";
+			const modeHint =
+				this.#config.mode === "conversational"
+					? "realtime audio + pi_turn"
+					: "transcription";
 			this.#notify(
-				`voice listening (${auth.mode} · ${this.#config.mode}${deviceNote}) — speak anytime; ctrl+shift+v toggles`,
+				`voice listening (${auth.mode} · ${this.#config.mode}/${modeHint}${deviceNote}) — speak anytime; ctrl+shift+v toggles`,
 				"info",
 			);
 			this.#pushUiStatus();
@@ -630,6 +750,8 @@ export class VoiceSession {
 		this.#clearSessionLimitTimer();
 		this.#clearEchoGuardTimer();
 		this.#playback.stop();
+		this.#pcmOut.stop();
+		this.#rejectSettledWaiters("voice stopped");
 		this.#setState("stopping");
 		this.#pushUiStatus();
 		this.#pushPartialWidget();
@@ -756,16 +878,18 @@ export class VoiceSession {
 			const event = args[0] as TranscriptEvent | undefined;
 			if (!event) return;
 			if (event.type === "speech_started") {
-				// Mark hearing before stop() so echo-guard resumes immediately.
+				// Prefer local energy barge-in while assistant is hot; server VAD
+				// often never fires because we pause the uplink during playback.
+				if (this.#assistantIsHot()) {
+					if (!this.#userBargeInSignal()) return;
+				}
+				this.#bargeIn(client);
 				this.#hearing = true;
 				this.#partial = "";
 				this.#clearEchoGuardTimer();
-				// Barge-in lite: stop speak-back when the user starts a new utterance.
-				this.#playback.stop();
 				if (!this.#agentBusy && this.#state === "listening") {
 					this.setCapturePaused(false);
 				}
-				this.#notify("voice: hearing you…", "info");
 			} else if (event.type === "speech_stopped") {
 				this.#hearing = false;
 				// Keep partial until final arrives.
@@ -810,10 +934,94 @@ export class VoiceSession {
 			}
 		};
 
+		const onFunctionCall = (...args: unknown[]) => {
+			if (gen !== this.#generation) return;
+			const event = args[0] as FunctionCallEvent | undefined;
+			if (!event) return;
+			void this.#handleFunctionCall(event, gen);
+		};
+		const onAudioDelta = (...args: unknown[]) => {
+			if (gen !== this.#generation) return;
+			if (this.#config.mode !== "conversational") return;
+			const event = args[0] as RealtimeAudioDeltaEvent | undefined;
+			if (!event?.delta) return;
+			const firstChunk = !this.#pcmOut.hasAudio();
+			this.#responseActive = true;
+			if (event.itemId) this.#assistantItemId = event.itemId;
+			if (firstChunk) {
+				this.#assistantAudioAt = Date.now();
+				// Snapshot current mic energy as echo reference.
+				this.#echoFloor = Math.max(this.#audioLevel, 0.01);
+				this.#bargeLoudTicks = 0;
+				// Drop residual mic audio already in the server buffer.
+				try {
+					(
+						client as { clearAudio?: () => void }
+					).clearAudio?.();
+				} catch {
+					// optional on fakes
+				}
+				// Pause uplink so speaker echo is not streamed back to the model.
+				// Local barge-in still runs from mic metering above.
+				this.setCapturePaused(true);
+			}
+			this.#pcmOut.appendBase64(event.delta, event.itemId);
+			this.#pushUiStatus();
+			this.#pushPartialWidget();
+		};
+		const onAudioDone = (...args: unknown[]) => {
+			if (gen !== this.#generation) return;
+			this.#pcmOut.done();
+		};
+		const onResponseCreated = (..._args: unknown[]) => {
+			if (gen !== this.#generation) return;
+			this.#responseActive = true;
+			this.#pushUiStatus();
+			this.#pushPartialWidget();
+		};
+		const onAssistantDelta = (...args: unknown[]) => {
+			if (gen !== this.#generation) return;
+			const event = args[0] as TranscriptEvent | undefined;
+			const piece = event?.text ?? "";
+			if (!piece) return;
+			// Reuse partial slot with a marker via widget path below.
+			this.#partial = `${this.#partial}${piece}`;
+			// Prefix-less accumulation under lastFinal for assistant flash is noisy;
+			// widget shows speaking state via #responseActive / pcmOut.
+			this.#pushPartialWidget();
+		};
+		const onAssistantDone = (...args: unknown[]) => {
+			if (gen !== this.#generation) return;
+			const event = args[0] as TranscriptEvent | undefined;
+			const text = event?.text?.trim() ?? this.#partial.trim();
+			this.#partial = "";
+			if (text) {
+				this.#lastFinal = text;
+				this.#lastFinalAt = Date.now();
+				this.#armFinalWidgetTimer(gen);
+			}
+			this.#responseActive = false;
+			this.#pushUiStatus();
+			this.#pushPartialWidget();
+		};
+
 		sub("transcript.done", onDone);
 		sub("transcript.delta", onDelta);
 		sub("speech.started", onSpeech);
 		sub("speech.stopped", onSpeech);
+		sub("function_call", onFunctionCall);
+		sub("audio.delta", onAudioDelta);
+		sub("audio.done", onAudioDone);
+		const onResponseDone = (..._args: unknown[]) => {
+			if (gen !== this.#generation) return;
+			this.#responseActive = false;
+			this.#pushUiStatus();
+			this.#pushPartialWidget();
+		};
+		sub("response.created", onResponseCreated);
+		sub("response.done", onResponseDone);
+		sub("assistant_transcript.delta", onAssistantDelta);
+		sub("assistant_transcript.done", onAssistantDone);
 		sub("error", onError);
 		sub("close", onClose);
 		this.#unsubs = unsubs;
@@ -843,6 +1051,11 @@ export class VoiceSession {
 	#handleFinalTranscript(event: TranscriptEvent): void {
 		const text = event.text?.trim() ?? "";
 		if (!text) return;
+
+		// Conversational: Realtime holds the dialogue; coding only via pi_turn.
+		if (this.#config.mode === "conversational") {
+			return;
+		}
 
 		const mode = this.#config.relayMode;
 		const target = this.#config.relayTarget?.trim();
@@ -899,6 +1112,215 @@ export class VoiceSession {
 			}
 		}
 		return !this.#agentBusy;
+	}
+
+	/**
+	 * Barge-in: stop local audio and truncate the Realtime assistant item.
+	 * Server VAD already cancels the in-progress response on speech_started;
+	 * we still send cancel + truncate for the WebSocket playback path.
+	 */
+	#assistantIsHot(): boolean {
+		return (
+			this.#responseActive ||
+			this.#pcmOut.isSpeaking() ||
+			this.#pcmOut.hasAudio()
+		);
+	}
+
+	/** True when mic energy looks like the user talking over the assistant. */
+	#userBargeInSignal(): boolean {
+		if (Date.now() - this.#assistantAudioAt < BARGE_IN_GRACE_MS) {
+			return false;
+		}
+		const floor = Math.max(this.#echoFloor, 0.015);
+		// Must beat both absolute floor and a multiple of the echo baseline.
+		const need = Math.max(BARGE_IN_LEVEL, floor * 2.2);
+		return this.#audioLevel >= need;
+	}
+
+	#maybeLocalBargeIn(client: RealtimeClientLike): void {
+		if (!this.#userBargeInSignal()) {
+			this.#bargeLoudTicks = 0;
+			return;
+		}
+		this.#bargeLoudTicks += 1;
+		if (this.#bargeLoudTicks < BARGE_IN_SUSTAIN) return;
+		this.#bargeLoudTicks = 0;
+		this.#bargeIn(client);
+		this.#hearing = true;
+		this.#partial = "";
+		this.#clearEchoGuardTimer();
+		if (!this.#agentBusy && this.#state === "listening") {
+			this.setCapturePaused(false);
+		}
+		this.#pushUiStatus();
+		this.#pushPartialWidget();
+	}
+
+	#bargeIn(client: RealtimeClientLike): void {
+		// Always cut local TTS / realtime PCM immediately.
+		this.#bargeLoudTicks = 0;
+		this.#playback.stop();
+		const hadAudio = this.#pcmOut.hasAudio() || this.#pcmOut.isSpeaking();
+		const itemId =
+			this.#pcmOut.getCurrentItemId() ?? this.#assistantItemId;
+		const shouldCancel =
+			this.#config.mode === "conversational" &&
+			(this.#responseActive || hadAudio || Boolean(itemId));
+		const { audioEndMs } = this.#pcmOut.stop();
+		this.#responseActive = false;
+		this.#assistantItemId = undefined;
+		if (!shouldCancel) return;
+		try {
+			client.cancelResponse?.();
+		} catch {
+			// ignore — benign when already finished
+		}
+		if (itemId) {
+			try {
+				client.truncateConversationItem?.(itemId, audioEndMs, 0);
+			} catch {
+				// ignore
+			}
+		}
+		this.#pushUiStatus();
+		this.#pushPartialWidget();
+	}
+
+	#rejectSettledWaiters(reason: string): void {
+		const waiters = this.#settledWaiters.splice(0);
+		for (const w of waiters) {
+			try {
+				w.resolve(`(interrupted: ${reason})`);
+			} catch {
+				// ignore
+			}
+		}
+	}
+
+	#waitAgentSettled(gen: number, timeoutMs = PI_TURN_TIMEOUT_MS): Promise<string> {
+		return new Promise((resolve) => {
+			let settled = false;
+			const entry = {
+				gen,
+				resolve: (summary: string) => {
+					if (settled) return;
+					settled = true;
+					this.#scheduler.clear(timer);
+					resolve(summary);
+				},
+			};
+			const timer = this.#scheduler.set(() => {
+				this.#settledWaiters = this.#settledWaiters.filter((w) => w !== entry);
+				entry.resolve("(pi turn timed out — agent still working)");
+			}, timeoutMs);
+			this.#settledWaiters.push(entry);
+			if (gen !== this.#generation) {
+				this.#settledWaiters = this.#settledWaiters.filter((w) => w !== entry);
+				entry.resolve("(session ended)");
+			}
+		});
+	}
+
+	async #handleFunctionCall(event: FunctionCallEvent, gen: number): Promise<void> {
+		if (gen !== this.#generation) return;
+		const name = event.name || "pi_turn";
+		if (name !== "pi_turn") {
+			this.#notify(`voice: ignoring unknown tool ${name}`, "warning");
+			this.#returnToolOutput(
+				event.callId,
+				JSON.stringify({
+					ok: false,
+					error: `unsupported tool: ${name}`,
+				}),
+			);
+			return;
+		}
+
+		let message = "";
+		try {
+			const parsed = JSON.parse(event.arguments || "{}") as {
+				message?: unknown;
+			};
+			message = typeof parsed.message === "string" ? parsed.message.trim() : "";
+		} catch {
+			message = "";
+		}
+
+		if (!message) {
+			this.#returnToolOutput(
+				event.callId,
+				JSON.stringify({ ok: false, error: "pi_turn requires message" }),
+			);
+			return;
+		}
+
+		this.#activePiTurns += 1;
+		// Tool call ends the current model response turn until we return output.
+		this.#responseActive = false;
+		this.#pushUiStatus();
+		this.#notify(`voice pi_turn → pi: ${truncate(message, 60)}`, "info");
+
+		const pi = this.#pi;
+		if (!pi) {
+			this.#activePiTurns = Math.max(0, this.#activePiTurns - 1);
+			this.#returnToolOutput(
+				event.callId,
+				JSON.stringify({
+					ok: false,
+					error: "no pi bridge bound — start voice inside pi",
+				}),
+			);
+			this.#pushUiStatus();
+			return;
+		}
+
+		// Register waiter before deliver to avoid missing a fast agent_settled.
+		const settledPromise = this.#waitAgentSettled(gen);
+		try {
+			// Steer while busy so conversational interrupts land promptly.
+			this.#deliverText(pi, message, {
+				isIdle: () => this.#probeIdle(),
+				whenBusy: "steer",
+			});
+		} catch (err) {
+			this.#activePiTurns = Math.max(0, this.#activePiTurns - 1);
+			this.notifyAgentSettled(`(bridge failed: ${errorMessage(err)})`);
+			this.#returnToolOutput(
+				event.callId,
+				JSON.stringify({
+					ok: false,
+					error: errorMessage(err),
+				}),
+			);
+			this.#pushUiStatus();
+			return;
+		}
+
+		const summary = await settledPromise;
+		if (gen !== this.#generation) return;
+		this.#activePiTurns = Math.max(0, this.#activePiTurns - 1);
+		this.#pushUiStatus();
+
+		const output = JSON.stringify({
+			ok: true,
+			summary: summarizeToolResult(summary),
+		});
+		this.#returnToolOutput(event.callId, output);
+	}
+
+	#returnToolOutput(callId: string, output: string): void {
+		const client = this.#client;
+		if (!client || !callId) return;
+		try {
+			client.sendFunctionCallOutput?.(callId, output);
+			client.createResponse?.();
+		} catch (err) {
+			this.#notify(
+				`voice tool output failed: ${errorMessage(err)}`,
+				"warning",
+			);
+		}
 	}
 
 	/**
@@ -1017,6 +1439,8 @@ export class VoiceSession {
 		this.#clearSessionLimitTimer();
 		this.#clearEchoGuardTimer();
 		this.#playback.stop();
+		this.#pcmOut.stop();
+		this.#rejectSettledWaiters(message);
 		const client = this.#client;
 		const capture = this.#capture;
 		this.#client = undefined;
@@ -1130,6 +1554,11 @@ export class VoiceSession {
 		this.#partial = "";
 		this.#lastFinal = "";
 		this.#lastFinalAt = 0;
+		this.#responseActive = false;
+		this.#assistantItemId = undefined;
+		this.#assistantAudioAt = 0;
+		this.#echoFloor = 0;
+		this.#bargeLoudTicks = 0;
 		this.#audioChunks = 0;
 		this.#audioLevel = 0;
 		this.#lastLevelUiAt = 0;
@@ -1186,10 +1615,20 @@ export class VoiceSession {
 			}
 
 			const partial = this.#partial.trim();
-			if (partial) {
+			if (this.#hearing) {
+				lines.push(
+					partial
+						? `voice ▸ ${truncate(partial, 100)}`
+						: "voice ▸ …",
+				);
+			} else if (this.#pcmOut.isSpeaking() || this.#responseActive) {
+				lines.push(
+					partial
+						? `voice ◂ ${truncate(partial, 100)}`
+						: "voice ◂ speaking…",
+				);
+			} else if (partial) {
 				lines.push(`voice ▸ ${truncate(partial, 100)}`);
-			} else if (this.#hearing) {
-				lines.push("voice ▸ …");
 			} else if (
 				this.#lastFinal &&
 				Date.now() - this.#lastFinalAt < FINAL_WIDGET_MS
@@ -1229,6 +1668,13 @@ export class VoiceSession {
 function truncate(text: string, max: number): string {
 	if (text.length <= max) return text;
 	return `${text.slice(0, Math.max(0, max - 1))}…`;
+}
+
+/** Keep function_call_output short for the voice model. */
+function summarizeToolResult(text: string, max = 800): string {
+	const t = text.replace(/\s+/g, " ").trim();
+	if (t.length <= max) return t;
+	return `${t.slice(0, max - 1)}…`;
 }
 
 function levelPct(level: number): string {

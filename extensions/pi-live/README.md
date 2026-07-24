@@ -1,19 +1,21 @@
 # pi-live extension
 
 A [pi](https://github.com/earendil-works/pi-coding-agent) extension with a small
-demo surface plus a **voice transcription + optional speak-back** loop (epic
+demo surface plus a **voice transcription / conversational** loop (epic
 [#6](https://github.com/BlockedPath/pi-live/issues/6), slices
 [#12](https://github.com/BlockedPath/pi-live/issues/12) /
 [#13](https://github.com/BlockedPath/pi-live/issues/13) /
-[#14](https://github.com/BlockedPath/pi-live/issues/14)).
+[#14](https://github.com/BlockedPath/pi-live/issues/14) /
+[#15](https://github.com/BlockedPath/pi-live/issues/15)).
 
 - custom tool: `hello`
 - `session_start` hook with a UI notification
 - `/hello` slash command
-- `/voice start|stop|status` transcription loop (mic → OpenAI Realtime → pi)
+- `/voice start|stop|status|mode` — transcription (default) or conversational
 - **`ctrl+shift+v`** toggle shortcut (same as bare `/voice`)
 - partial/final transcript widget above the editor
-- optional TTS speak-back on `agent_settled` (macOS `say` or OpenAI TTS)
+- optional TTS speak-back on `agent_settled` (macOS `say` or OpenAI TTS) in transcription mode
+- conversational mode: Realtime audio out + narrow `pi_turn` tool (coding stays in pi)
 - prefs persistence via `appendEntry("voice-state")` (mode/tts/voice/device)
 - auto-reconnect on WS drop + proactive refresh before the ~60-minute session limit
 
@@ -81,9 +83,16 @@ Once loaded:
 
 ---
 
-## Voice transcription MVP
+## Voice
 
-Hands-free dictate → final transcript → `pi.sendUserMessage` → coding turn.
+Two modes (default **transcription**):
+
+| Mode | What happens | Cost profile |
+| --- | --- | --- |
+| **transcription** (default) | Mic → Realtime STT only (`output_modalities: ["text"]`) → final transcript bridges into pi → optional local/OpenAI TTS speak-back | Lower — mostly input transcription + optional short TTS |
+| **conversational** | Mic ↔ Realtime full-duplex audio; model may call **`pi_turn({ message })` only**; pi runs the coding turn; tool result returns as `function_call_output`; Realtime speaks a brief status | Higher — continuous realtime audio in/out + tool rounds |
+
+In both modes **the Realtime model never edits files or runs shell** — coding always goes through pi (`sendUserMessage` / `pi_turn` → agent loop).
 
 ### Prerequisites
 
@@ -110,10 +119,11 @@ Hands-free dictate → final transcript → `pi.sendUserMessage` → coding turn
 
 ```
 /voice                 # toggle start/stop
-/voice start           # connect + capture + stream
-/voice stop            # close WS + stop mic + stop TTS
+/voice start [mode]    # connect + capture + stream (optional mode)
+/voice stop            # close WS + stop mic + stop TTS / realtime audio
 /voice status          # mode, state, auth preference/mode (no secrets)
 /voice toggle          # same as bare /voice
+/voice mode transcription|conversational
 ```
 
 Keyboard shortcut (TUI):
@@ -146,7 +156,7 @@ or API keys are never written into pi session transcripts or status lines.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `PI_VOICE_MODE` | `transcription` | `transcription` (MVP). `conversational` comes later (#15). |
+| `PI_VOICE_MODE` | `transcription` | `transcription` (default) or `conversational` (Realtime audio + `pi_turn`) |
 | `PI_VOICE_MODEL` | `gpt-realtime-2.1` | Realtime model id |
 | `PI_VOICE_VOICE` | `marin` | TTS voice (OpenAI names for `openai`; macOS voice name for `say`, e.g. `Samantha`) |
 | `PI_VOICE_TTS` | `say` on macOS, else `off` | Speak-back backend: `say` \| `openai` \| `off` |
@@ -171,7 +181,7 @@ On `session_start` / resume / `/reload`, the latest `voice-state` entry is
 restored into the live session **unless** the matching `PI_VOICE_*` env var is
 set (env always wins). Tokens and API keys are never stored.
 
-### Manual test
+### Manual test — transcription (default)
 
 ```bash
 # --- Local Ghostty pane (mic works; satellite voice) ---
@@ -186,6 +196,25 @@ export PI_VOICE_RELAY_TARGET=vs5-session   # main coding agent name or pane id
 pi -e ./src/index.ts
 # /voice start  → speak a task → pi works → hears a short spoken summary
 ```
+
+### Manual test — conversational (`pi_turn`)
+
+```bash
+cd extensions/pi-live && npm install
+# Optional: PI_VOICE_MODE=conversational
+pi -e ./src/index.ts
+# /voice mode conversational
+# /voice start
+# Speak naturally, e.g. "list the TypeScript files in this repo"
+# Expect: Realtime may reply briefly, then call pi_turn → pi runs tools →
+#         function_call_output → Realtime speaks a short status.
+# Barge-in: talk over the assistant — playback stops / response truncates.
+# /voice mode transcription   # back to cheaper STT-only default
+# /voice stop
+```
+
+Requires sox `play` on PATH for Realtime PCM playback (`brew install sox`).
+Without `play`, barge-in truncate timing still works; you just won't hear audio out.
 
 ### Talk-back (TTS) manual check
 
@@ -222,20 +251,19 @@ pi -e ./src/index.ts
 | `types.ts` | Shared contracts (auth, session, transcripts, bridge) |
 | `config.ts` | `PI_VOICE_*` env → typed config |
 | `auth.ts` | Codex OAuth load/refresh + API key fallback |
-| `realtime-client.ts` | GA Realtime WebSocket client |
+| `realtime-client.ts` | GA Realtime WebSocket client (+ `pi_turn` session / tool events) |
 | `capture.ts` | mic → PCM16 mono via sox/rec |
 | `bridge.ts` | final text → `pi.sendUserMessage` (idle / steer) |
 | `playback.ts` | TTS speak-back (`say` / OpenAI / off) |
 | `prefs.ts` | `voice-state` parse/restore helpers |
-| `session.ts` | start/stop/status + reconnect + widget + speakBack |
+| `session.ts` | start/stop/status + reconnect + widget + speakBack + conversational pi_turn |
 | `index.ts` | Public barrel |
 
-### Later slices (not in this MVP)
+### Later slices
 
-- #15 conversational mode + `pi_turn` tool  
 - #16 optional Codex app-server backend  
 
-Session hooks used by polish/speak-back: `setCapturePaused`, `speakBack`,
+Session hooks: `setCapturePaused`, `speakBack`, `setMode`, `notifyAgentSettled`,
 `onStateChange`, `applyPrefs` / `getPrefs`.
 
 ## Layout
