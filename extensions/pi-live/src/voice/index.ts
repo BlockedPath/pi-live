@@ -67,6 +67,7 @@ export {
 	createVoiceClient,
 	CodexAppServerBackend,
 	CodexBackendError,
+	CODEX_V3_VOICES,
 	DEFAULT_CODEX_BIN,
 	detectCodexCli,
 	type CodexAppServerBackendOptions,

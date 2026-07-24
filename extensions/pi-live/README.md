@@ -270,7 +270,7 @@ Without `play`, barge-in truncate timing still works; you just won't hear audio 
 | `codex backend requires the Codex CLI` | Install/update Codex, ensure `codex` is on the pi process `PATH`, and run `codex --version`. Or unset `PI_VOICE_BACKEND` to use the default OpenAI backend. |
 | `experimentalApi capability` | Update to the latest branch/PR version; the adapter must send `capabilities.experimentalApi=true` during initialize. |
 | `text realtime output modality requires realtime v2` | Update to the latest branch/PR version; transcription now selects V2 text automatically while conversational mode uses V3 audio. |
-| `realtime conversation requires API key auth` | V2 text mode on some accounts needs a key — export `PI_VOICE_API_KEY`/`OPENAI_API_KEY`, or use `PI_VOICE_MODE=conversational` (V3 audio) which works with ChatGPT OAuth. |
+| `realtime voice \`<name>\` is not supported for v3` | Codex V3 audio only accepts: juniper, maple, spruce, ember, vale, breeze, arbor, sol, cove. The adapter drops an unsupported `PI_VOICE_VOICE` (e.g. the default `marin`) and lets Codex pick its own; set `PI_VOICE_VOICE=juniper` to choose one. |
 | `codex realtime rejected start` | Check the full reported message, Codex version, and model/account entitlement. Use `PI_VOICE_BACKEND=openai` to return to the default backend. |
 | `sox/rec not found on PATH` | `brew install sox`; ensure Homebrew’s bin is on `PATH` inside the pi process. |
 | WS 401 / 403 | OAuth expired — re-login via Codex; or switch to a valid API key. |

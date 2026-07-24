@@ -192,6 +192,30 @@ describe("CodexAppServerBackend — handshake", () => {
 		const realtime = transport.lastSentOfType("thread/realtime/start");
 		assert.equal(realtime?.outputModality, "audio");
 		assert.equal(realtime?.version, "v3");
+		// Default `marin` is NOT a V3 voice — it must be dropped, not forwarded.
+		assert.equal(realtime?.voice, undefined);
+	});
+
+	it("forwards a supported V3 voice in conversational mode", async () => {
+		const transport = new FakeTransport();
+		const backend = new CodexAppServerBackend({ transport, skipDetect: true });
+		const connectPromise = backend.connect(
+			{},
+			{ model: "gpt-realtime-2.1", voice: "juniper", mode: "conversational" },
+		);
+		await waitSent(transport, "initialize", 1);
+		transport.receive({ id: 1, result: { codexHome: "/tmp/codex" } });
+		await waitSent(transport, "thread/start", 1);
+		transport.receive({ id: 2, result: { thread: { id: "thr_123" } } });
+		await waitSent(transport, "thread/realtime/start", 1);
+		transport.receive({ id: 3, result: {} });
+		transport.receive({
+			method: "thread/realtime/started",
+			params: { threadId: "thr_123", realtimeSessionId: "rsess_1", version: "v3" },
+		});
+		await connectPromise;
+		const realtime = transport.lastSentOfType("thread/realtime/start");
+		assert.equal(realtime?.voice, "juniper");
 	});
 
 	it("rejects when thread/realtime/error arrives before started", async () => {

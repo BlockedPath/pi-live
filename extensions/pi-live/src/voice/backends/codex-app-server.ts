@@ -87,6 +87,22 @@ import type { RealtimeClientLike, TranscriptEvent } from "../types.js";
 /** Codex binary used when spawning the app-server (override in tests). */
 export const DEFAULT_CODEX_BIN = "codex";
 
+/**
+ * Voice names accepted by Codex app-server V3 bidi realtime (0.145). The OpenAI
+ * Realtime default `marin` is NOT in this set and is rejected, so we only
+ * forward `voice` when it matches — otherwise the server picks its own default.
+ */
+export const CODEX_V3_VOICES = new Set([
+	"juniper",
+	"maple",
+	"spruce",
+	"ember",
+	"vale",
+	"breeze",
+	"arbor",
+	"sol",
+	"cove",
+]);
 /** Machine-readable reason codes for backend failures (surfaced in errors). */
 export type CodexBackendErrorCode =
 	| "cli_missing"
@@ -431,7 +447,15 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 				version,
 			};
 			if (cfg.model) realtimeParams.model = cfg.model;
-			if (cfg.voice) realtimeParams.voice = cfg.voice;
+			// V3 audio realtime rejects the OpenAI default `marin` and other unsupported
+			// voice names; only forward a voice the server accepts, else let it pick a
+			// default. V2 text tolerates any voice name (it produces no audio).
+			if (
+				cfg.voice &&
+				(outputModality !== "audio" || CODEX_V3_VOICES.has(cfg.voice))
+			) {
+				realtimeParams.voice = cfg.voice;
+			}
 
 			// Subscribe before sending: app-server can return the response and
 			// started notification in the same stdout batch.
