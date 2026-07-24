@@ -25,6 +25,23 @@ export {
 	VoiceSession,
 } from "./session.js";
 
+export {
+	buildDefaultSessionConfig,
+	connectConfigFromVoice,
+	DEFAULT_REALTIME_URL,
+	mergeSessionConfig,
+	RealtimeClient,
+	type RealtimeClientError,
+	type RealtimeClientEvent,
+	type RealtimeClientEventMap,
+	type RealtimeClientOptions,
+	type RealtimeConnectConfig,
+	type RealtimeServerEvent,
+	type RealtimeSessionConfig,
+	type WebSocketFactory,
+	type WebSocketLike,
+} from "./realtime-client.js";
+
 export type {
 	BridgeDeliveryMode,
 	DeliverVoiceText,
