@@ -1,5 +1,6 @@
 /**
- * pi-live extension — demo skeleton + voice transcription MVP (VS5 / #12).
+ * pi-live extension — demo skeleton + voice transcription MVP (VS5 / #12)
+ * with optional speak-back (VS6 / #13).
  *
  * Install locally (one of):
  *   - `cd extensions/pi-live && pi install .`
@@ -12,12 +13,15 @@
  * Auth via Codex OAuth (`~/.codex`) or API key; mic via sox/rec; transcripts
  * bridge into pi via `sendUserMessage`.
  * Optional input device: `PI_VOICE_INPUT_DEVICE='iPhone Microphone'`.
+ * Optional TTS: `PI_VOICE_TTS=say|openai|off` (default say on macOS).
  */
-
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { getSharedVoiceSession } from "./voice/index.js";
+import {
+	extractLastAssistantText,
+	getSharedVoiceSession,
+} from "./voice/index.js";
 
 /**
  * A minimal custom tool the LLM can call. Replace this with your own.
@@ -51,12 +55,15 @@ function formatVoiceStatus(): string {
 		`voice=${info.voice}`,
 		`sampleRate=${info.sampleRate}`,
 	);
+	if (info.tts) parts.push(`tts=${info.tts}`);
+	if (info.speaking) parts.push("speaking=yes");
 	if (info.capturePaused) parts.push("capture=paused");
 	if (info.hearing) parts.push("hearing=yes");
 	if (info.inputDevice) parts.push(`in=${info.inputDevice}`);
 	if (info.captureBackend) parts.push(`backend=${info.captureBackend}`);
 	if (info.relayTarget) parts.push(`relay=${info.relayTarget}`);
-	if (info.relayMode && info.relayMode !== "local") parts.push(`relayMode=${info.relayMode}`);
+	if (info.relayMode && info.relayMode !== "local")
+		parts.push(`relayMode=${info.relayMode}`);
 	if (typeof info.audioChunks === "number") {
 		parts.push(`micChunks=${info.audioChunks}`);
 	}
@@ -112,6 +119,8 @@ function parseVoiceArgs(args: string | undefined): {
 
 export default function (pi: ExtensionAPI) {
 	const session = getSharedVoiceSession();
+	/** Last assistant text from agent_end — spoken on agent_settled. */
+	let pendingSpeakText = "";
 
 	// Surface a small note when a session starts so you can see the extension load.
 	pi.on("session_start", async (_event, ctx) => {
@@ -125,14 +134,27 @@ export default function (pi: ExtensionAPI) {
 		session.setAgentBusy(true);
 	});
 
-	// Resume capture once the agent has fully settled.
+	// Cache speakable assistant text from the low-level run.
+	pi.on("agent_end", async (event) => {
+		const text = extractLastAssistantText(event.messages ?? []);
+		if (text) pendingSpeakText = text;
+	});
+
+	// Resume capture once the agent has fully settled; optional speak-back.
 	pi.on("agent_settled", async (_event, ctx) => {
 		session.bindUi(voiceUiFromCtx(ctx));
 		session.setAgentBusy(false);
+		const text = pendingSpeakText;
+		pendingSpeakText = "";
+		if (text && session.isLive()) {
+			// Fire-and-forget so other extensions are not blocked on TTS.
+			void session.speakBack(text);
+		}
 	});
 
-	// Best-effort teardown on shutdown so sox/ws do not linger.
+	// Best-effort teardown on shutdown so sox/ws/tts do not linger.
 	pi.on("session_shutdown", async () => {
+		session.stopPlayback();
 		if (session.isLive()) {
 			try {
 				await session.stop();
@@ -153,9 +175,10 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// VS5: full transcription MVP control surface.
+	// VS5+VS6: transcription MVP + optional speak-back.
 	pi.registerCommand("voice", {
-		description: "Voice transcription: /voice [start|stop|status|toggle] (MVP)",
+		description:
+			"Voice: /voice [start|stop|status|toggle] (TTS via PI_VOICE_TTS)",
 		handler: async (args, ctx) => {
 			const { sub } = parseVoiceArgs(args);
 			const sessionRef = getSharedVoiceSession();

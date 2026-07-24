@@ -3,10 +3,10 @@
  *
  * Defaults match the voice realtime plan (issue #7 / epic #6).
  */
-
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { resolveTtsBackend, type TtsBackend } from "./playback.js";
 import type { VoiceAuthPrefer, VoiceMode } from "./types.js";
 
 export type VoiceRelayMode = "local" | "relay" | "both";
@@ -18,6 +18,8 @@ export interface VoiceConfig {
 	model: string;
 	/** TTS voice name when playback is enabled. */
 	voice: string;
+	/** Speak-back backend: `say` | `openai` | `off`. */
+	tts: TtsBackend;
 	/** Auth preference passed to resolveVoiceAuth (#8). */
 	auth: VoiceAuthPrefer;
 	/** Codex home directory (auth.json location). `~` is expanded. */
@@ -104,12 +106,16 @@ export function loadVoiceConfig(
 		mode: parseMode(env.PI_VOICE_MODE?.trim()),
 		model: env.PI_VOICE_MODEL?.trim() || DEFAULTS.model,
 		voice: env.PI_VOICE_VOICE?.trim() || DEFAULTS.voice,
+		tts: resolveTtsBackend(env.PI_VOICE_TTS),
 		auth: parseAuth(env.PI_VOICE_AUTH?.trim()),
 		codexHome: expandHome(codexHomeRaw),
 		sampleRate: parseSampleRate(env.PI_VOICE_SAMPLE_RATE?.trim()),
 		inputDevice: env.PI_VOICE_INPUT_DEVICE?.trim() || undefined,
 		relayTarget,
-		relayMode: parseRelayMode(env.PI_VOICE_RELAY_MODE?.trim(), Boolean(relayTarget)),
+		relayMode: parseRelayMode(
+			env.PI_VOICE_RELAY_MODE?.trim(),
+			Boolean(relayTarget),
+		),
 		apiKey: apiKey || undefined,
 	};
 }
