@@ -1,6 +1,6 @@
 /**
  * pi-live extension — demo skeleton + voice transcription MVP (VS5 / #12)
- * with optional speak-back (VS6 / #13).
+ * with optional speak-back (VS6 / #13) and UX polish (VS7 / #14).
  *
  * Install locally (one of):
  *   - `cd extensions/pi-live && pi install .`
@@ -9,11 +9,12 @@
  *
  * See CONTRIBUTING.md and ./README.md for the local development loop.
  *
- * Voice MVP: `/voice start|stop|status` (toggle with bare `/voice`).
+ * Voice MVP: `/voice start|stop|status` (toggle with bare `/voice` or ctrl+shift+v).
  * Auth via Codex OAuth (`~/.codex`) or API key; mic via sox/rec; transcripts
  * bridge into pi via `sendUserMessage`.
  * Optional input device: `PI_VOICE_INPUT_DEVICE='iPhone Microphone'`.
  * Optional TTS: `PI_VOICE_TTS=say|openai|off` (default say on macOS).
+ * Prefs (mode/tts/device/voice) persist via `appendEntry("voice-state")`.
  */
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -21,6 +22,9 @@ import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	extractLastAssistantText,
 	getSharedVoiceSession,
+	prefsHonoringEnv,
+	readLatestVoiceStatePrefs,
+	VOICE_STATE_TYPE,
 } from "./voice/index.js";
 
 /**
@@ -117,14 +121,50 @@ function parseVoiceArgs(args: string | undefined): {
 	return { sub, rest: tokens.slice(1) };
 }
 
+/** Persist non-secret voice prefs into the session transcript. */
+function persistVoicePrefs(pi: ExtensionAPI): void {
+	try {
+		const prefs = getSharedVoiceSession().getPrefs();
+		pi.appendEntry(VOICE_STATE_TYPE, prefs);
+	} catch {
+		// Session may be ephemeral / append unavailable — ignore.
+	}
+}
+
+/** Restore last voice-state entry, honoring explicit PI_VOICE_* env overrides. */
+function restoreVoicePrefs(pi: ExtensionAPI, ctx: {
+	sessionManager: { getEntries: () => ReadonlyArray<{ type: string; customType?: string; data?: unknown }> };
+}): void {
+	try {
+		const entries = ctx.sessionManager.getEntries();
+		const saved = readLatestVoiceStatePrefs(entries);
+		if (!saved) return;
+		const patch = prefsHonoringEnv(saved);
+		// Skip no-op empty patches (only v:1).
+		if (
+			patch.mode === undefined &&
+			patch.tts === undefined &&
+			patch.voice === undefined &&
+			patch.inputDevice === undefined
+		) {
+			return;
+		}
+		getSharedVoiceSession().applyPrefs(patch);
+	} catch {
+		// Best-effort restore.
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	const session = getSharedVoiceSession();
 	/** Last assistant text from agent_end — spoken on agent_settled. */
 	let pendingSpeakText = "";
 
 	// Surface a small note when a session starts so you can see the extension load.
+	// Restore voice prefs from prior session entries when present.
 	pi.on("session_start", async (_event, ctx) => {
 		session.bindUi(voiceUiFromCtx(ctx));
+		restoreVoicePrefs(pi, ctx);
 		ctx.ui.notify("pi-live extension loaded", "info");
 	});
 
@@ -154,6 +194,10 @@ export default function (pi: ExtensionAPI) {
 
 	// Best-effort teardown on shutdown so sox/ws/tts do not linger.
 	pi.on("session_shutdown", async () => {
+		// Persist prefs so a resume/reload can restore mode/tts/device.
+		if (session.getState() !== "idle" || session.getPrefs()) {
+			persistVoicePrefs(pi);
+		}
 		session.stopPlayback();
 		if (session.isLive()) {
 			try {
@@ -175,10 +219,40 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// VS5+VS6: transcription MVP + optional speak-back.
+	// VS7: ctrl+shift+v toggles voice (same as bare `/voice`).
+	pi.registerShortcut("ctrl+shift+v", {
+		description: "Toggle voice transcription",
+		handler: async (ctx) => {
+			const sessionRef = getSharedVoiceSession();
+			const ui = voiceUiFromCtx(ctx);
+			sessionRef.bindUi(ui);
+			const startOpts = {
+				pi,
+				isIdle: () => ctx.isIdle(),
+				ui,
+			};
+			try {
+				const action = await sessionRef.toggle(startOpts);
+				if (action === "started") {
+					persistVoicePrefs(pi);
+					if (sessionRef.getState() === "listening") {
+						reportVoiceStatus(ctx);
+					}
+				} else {
+					persistVoicePrefs(pi);
+				}
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				ctx.ui.notify(`voice failed: ${message}`, "error");
+				ctx.ui.setStatus?.("voice", `voice: error: ${message}`);
+			}
+		},
+	});
+
+	// VS5+VS6+VS7: transcription MVP + speak-back + polish.
 	pi.registerCommand("voice", {
 		description:
-			"Voice: /voice [start|stop|status|toggle] (TTS via PI_VOICE_TTS)",
+			"Voice: /voice [start|stop|status|toggle] · shortcut ctrl+shift+v",
 		handler: async (args, ctx) => {
 			const { sub } = parseVoiceArgs(args);
 			const sessionRef = getSharedVoiceSession();
@@ -199,6 +273,7 @@ export default function (pi: ExtensionAPI) {
 
 				if (sub === "start") {
 					await sessionRef.start(startOpts);
+					persistVoicePrefs(pi);
 					// start already notifies; refresh detailed status line
 					if (sessionRef.getState() === "listening") {
 						reportVoiceStatus(ctx);
@@ -208,29 +283,31 @@ export default function (pi: ExtensionAPI) {
 
 				if (sub === "stop") {
 					await sessionRef.stop();
+					persistVoicePrefs(pi);
 					return;
 				}
 
 				// Bare `/voice` or explicit toggle — start when idle, stop when live.
 				if (sub === "" || sub === "toggle") {
 					const action = await sessionRef.toggle(startOpts);
+					persistVoicePrefs(pi);
 					if (action === "started" && sessionRef.getState() === "listening") {
 						reportVoiceStatus(ctx);
 					}
 					return;
 				}
 
-				// Mode switch is reserved for conversational (#14); acknowledge politely.
+				// Mode switch is reserved for conversational (#15); acknowledge politely.
 				if (sub === "mode") {
 					ctx.ui.notify(
-						`/voice mode is not available yet (conversational lands in #14). Current mode=${sessionRef.getConfig().mode}.`,
+						`/voice mode is not available yet (conversational lands in #15). Current mode=${sessionRef.getConfig().mode}.`,
 						"warning",
 					);
 					return;
 				}
 
 				ctx.ui.notify(
-					`Unknown /voice subcommand "${sub}". Try start|stop|status|toggle.`,
+					`Unknown /voice subcommand "${sub}". Try start|stop|status|toggle (or ctrl+shift+v).`,
 					"warning",
 				);
 			} catch (err) {

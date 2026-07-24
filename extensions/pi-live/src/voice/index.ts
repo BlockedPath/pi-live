@@ -1,8 +1,9 @@
 /**
  * Public barrel for the pi-live voice module.
  *
- * Stable export surface across voice slices (#7–#13+).
+ * Stable export surface across voice slices (#7–#14+).
  * VS5: VoiceSession state machine. VS6: playback / TTS speak-back.
+ * VS7: prefs, reconnect, widget polish.
  */
 
 export {
@@ -33,6 +34,16 @@ export {
 	type VoiceSessionStartOptions,
 	type VoiceSessionUi,
 } from "./session.js";
+
+export {
+	parseVoiceStatePrefs,
+	prefsHonoringEnv,
+	readLatestVoiceStatePrefs,
+	VOICE_STATE_TYPE,
+	voiceStateFromFields,
+	type VoiceStateEntryLike,
+	type VoiceStatePrefs,
+} from "./prefs.js";
 
 export {
 	DEFAULT_SPEAK_MAX_CHARS,

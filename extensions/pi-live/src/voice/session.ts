@@ -1,11 +1,13 @@
 /**
- * Voice session state machine (VS5 / issue #12 + VS6 playback / #13).
+ * Voice session state machine (VS5–VS7 / issues #12–#14).
  *
  * Wires auth + realtime client + mic capture + pi bridge into a working
  * transcription loop. VS6 adds optional speak-back via `playback.ts` on
  * `speakBack()`, coordinated with `setCapturePaused` for echo reduction.
+ * VS7 adds transcript widget polish, prefs, reconnect / 60m session limit,
+ * and a short post-TTS echo guard.
  *
- * Public hooks for later slices: onTranscript, onStateChange, setCapturePaused.
+ * Public hooks: onTranscript, onStateChange, setCapturePaused, applyPrefs.
  *
  * State machine: idle → connecting → listening → stopping → idle (+ error)
  */
@@ -22,8 +24,13 @@ import { loadVoiceConfig, type VoiceConfig } from "./config.js";
 import {
 	VoicePlayback,
 	type SpawnFn,
+	type TtsBackend,
 	type VoicePlaybackOptions,
 } from "./playback.js";
+import {
+	voiceStateFromFields,
+	type VoiceStatePrefs,
+} from "./prefs.js";
 import {
 	connectConfigFromVoice,
 	RealtimeClient,
@@ -35,6 +42,7 @@ import type {
 	TranscriptEvent,
 	VoiceAuth,
 	VoiceAuthMode,
+	VoiceMode,
 	VoiceSessionState,
 	VoiceSessionStatus,
 } from "./types.js";
@@ -43,7 +51,7 @@ import type {
 export interface VoiceSessionUi {
 	notify(message: string, type?: "info" | "warning" | "error"): void;
 	setStatus?(key: string, text: string | undefined): void;
-	/** Optional one-line partial transcript widget above the editor. */
+	/** Optional transcript widget above the editor. */
 	setWidget?(key: string, content: string[] | undefined): void;
 }
 
@@ -78,6 +86,19 @@ export interface VoiceSessionDeps {
 	createPlayback?: (options: VoicePlaybackOptions) => VoicePlayback;
 	/** Injectable spawn for default playback (tests). */
 	spawn?: SpawnFn;
+	/**
+	 * Injectable delay (tests). Defaults to `setTimeout`.
+	 * Used for reconnect backoff and echo-guard hold-off.
+	 */
+	delay?: (ms: number) => Promise<void>;
+	/**
+	 * Injectable timer scheduler (tests). Defaults to `setTimeout`/`clearTimeout`.
+	 * Used for the 60-minute session refresh and final-widget clear.
+	 */
+	scheduler?: {
+		set: (fn: () => void, ms: number) => unknown;
+		clear: (id: unknown) => void;
+	};
 }
 
 type Unsubscribe = () => void;
@@ -97,6 +118,19 @@ const LIVE_STATES: ReadonlySet<VoiceSessionState> = new Set([
 const SILENCE_ABS = 200;
 /** Throttle footer refreshes while streaming mic levels. */
 const LEVEL_UI_MIN_MS = 250;
+/** How long a final transcript stays visible in the widget. */
+const FINAL_WIDGET_MS = 4_000;
+/** Brief mic hold-off after TTS so speaker tail is not transcribed. */
+const ECHO_GUARD_AFTER_TTS_MS = 350;
+/** Max automatic WS reconnect attempts after an unexpected drop. */
+const MAX_RECONNECT_ATTEMPTS = 3;
+/** Base delay between reconnect attempts (multiplied by attempt #). */
+const RECONNECT_BASE_DELAY_MS = 700;
+/**
+ * Proactively refresh the Realtime session before OpenAI's ~60-minute
+ * connection limit. 55 minutes leaves headroom for auth + handshake.
+ */
+const SESSION_LIMIT_REFRESH_MS = 55 * 60 * 1000;
 
 function errorMessage(err: unknown): string {
 	if (err instanceof VoiceAuthError) return err.message;
@@ -104,14 +138,39 @@ function errorMessage(err: unknown): string {
 	return String(err);
 }
 
+function defaultDelay(ms: number): Promise<void> {
+	return new Promise((resolve) => {
+		const t = setTimeout(resolve, ms);
+		// Don't keep the process alive for reconnect/echo timers alone.
+		(t as NodeJS.Timeout).unref?.();
+	});
+}
+
+const defaultScheduler = {
+	set: (fn: () => void, ms: number): unknown => {
+		const t = setTimeout(fn, ms);
+		(t as NodeJS.Timeout).unref?.();
+		return t;
+	},
+	clear: (id: unknown): void => {
+		if (id !== undefined && id !== null) clearTimeout(id as NodeJS.Timeout);
+	},
+};
+
 export class VoiceSession {
-	readonly #config: VoiceConfig;
+	/** Mutable so prefs restore / future `/voice` knobs can update it. */
+	#config: VoiceConfig;
 	readonly #resolveAuth: NonNullable<VoiceSessionDeps["resolveAuth"]>;
 	readonly #createClient: NonNullable<VoiceSessionDeps["createClient"]>;
 	readonly #createCapture: NonNullable<VoiceSessionDeps["createCapture"]>;
 	readonly #deliverText: NonNullable<VoiceSessionDeps["deliverText"]>;
 	readonly #relayText: NonNullable<VoiceSessionDeps["relayText"]>;
 	readonly #playback: VoicePlayback;
+	readonly #delay: (ms: number) => Promise<void>;
+	readonly #scheduler: {
+		set: (fn: () => void, ms: number) => unknown;
+		clear: (id: unknown) => void;
+	};
 
 	#state: VoiceSessionState = "idle";
 	#error: string | undefined;
@@ -119,7 +178,7 @@ export class VoiceSession {
 	#capturePaused = false;
 	#agentBusy = false;
 	#speaking = false;
-	/** Monotonic generation — invalidates in-flight start/stop work. */
+	/** Monotonic generation — invalidates in-flight start/stop/reconnect work. */
 	#generation = 0;
 
 	#client: RealtimeClientLike | undefined;
@@ -134,6 +193,9 @@ export class VoiceSession {
 	#hearing = false;
 	/** Accumulated partial transcript for the current utterance. */
 	#partial = "";
+	/** Last final transcript (briefly shown in the widget). */
+	#lastFinal = "";
+	#lastFinalAt = 0;
 	/** Mic chunks observed since last start (proves capture path). */
 	#audioChunks = 0;
 	/** Smoothed 0–1 level from recent PCM. */
@@ -142,11 +204,19 @@ export class VoiceSession {
 	#hadAudible = false;
 	#captureBackend: string | undefined;
 
+	/** Soft-reconnect bookkeeping. */
+	#reconnecting = false;
+	#reconnectAttempts = 0;
+	#sessionLimitTimer: unknown;
+	#echoGuardTimer: unknown;
+	#finalWidgetTimer: unknown;
+
 	readonly #stateHandlers = new Set<StateChangeHandler>();
 	readonly #transcriptHandlers = new Set<TranscriptHandler>();
 
 	constructor(deps: VoiceSessionDeps = {}) {
-		this.#config = deps.config ?? loadVoiceConfig();
+		// Clone so applyPrefs can mutate without touching frozen defaults.
+		this.#config = { ...(deps.config ?? loadVoiceConfig()) };
 		this.#resolveAuth =
 			deps.resolveAuth ??
 			((options) =>
@@ -165,6 +235,8 @@ export class VoiceSession {
 				}));
 		this.#deliverText = deps.deliverText ?? deliverVoiceText;
 		this.#relayText = deps.relayText ?? defaultHerdrRelay;
+		this.#delay = deps.delay ?? defaultDelay;
+		this.#scheduler = deps.scheduler ?? defaultScheduler;
 		const playbackOpts: VoicePlaybackOptions = {
 			backend: this.#config.tts,
 			voice: this.#config.voice,
@@ -174,16 +246,7 @@ export class VoiceSession {
 		this.#playback =
 			deps.createPlayback?.(playbackOpts) ?? new VoicePlayback(playbackOpts);
 		this.#playback.onSpeakingChange((speaking) => {
-			this.#speaking = speaking;
-			if (speaking) {
-				this.setCapturePaused(true);
-			} else if (
-				this.#state === "listening" &&
-				!this.#agentBusy
-			) {
-				this.setCapturePaused(false);
-			}
-			this.#pushUiStatus();
+			this.#onSpeakingChange(speaking);
 		});
 	}
 
@@ -197,16 +260,27 @@ export class VoiceSession {
 		return LIVE_STATES.has(this.#state);
 	}
 
+	/** True while a soft reconnect is in flight. */
+	isReconnecting(): boolean {
+		return this.#reconnecting;
+	}
+
 	/** Short status string suitable for `/voice status` and footer setStatus. */
 	getStatus(): string {
 		if (this.#state === "error" && this.#error) {
 			return `error: ${this.#error}`;
 		}
+		if (this.#reconnecting) {
+			return `reconnecting (${this.#reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})…`;
+		}
 		if (this.#speaking) {
 			return "speaking…";
 		}
 		if (this.#state === "listening" && this.#capturePaused) {
-			return "pi working…";
+			// Distinguish agent-busy gate from TTS echo-guard hold-off.
+			if (this.#agentBusy) return "pi working…";
+			if (this.#echoGuardTimer) return "echo guard…";
+			return "paused…";
 		}
 		if (this.#state === "listening") {
 			const partial = this.#partial.trim();
@@ -269,9 +343,44 @@ export class VoiceSession {
 		return this.#config;
 	}
 
+	/** Snapshot suitable for `pi.appendEntry("voice-state", …)`. */
+	getPrefs(): VoiceStatePrefs {
+		return voiceStateFromFields({
+			mode: this.#config.mode,
+			tts: this.#config.tts,
+			voice: this.#config.voice,
+			inputDevice: this.#config.inputDevice,
+		});
+	}
+
+	/**
+	 * Apply restored / user prefs (mode, tts, voice, input device).
+	 * Safe while idle; device changes take effect on the next start.
+	 * Does not write secrets.
+	 */
+	applyPrefs(prefs: VoiceStatePrefs): void {
+		if (prefs.mode !== undefined) {
+			this.#config = { ...this.#config, mode: prefs.mode as VoiceMode };
+		}
+		if (prefs.tts !== undefined) {
+			const tts = prefs.tts as TtsBackend;
+			this.#config = { ...this.#config, tts };
+			this.#playback.configure({ backend: tts });
+		}
+		if (prefs.voice !== undefined) {
+			this.#config = { ...this.#config, voice: prefs.voice };
+			this.#playback.configure({ voice: prefs.voice });
+		}
+		if (prefs.inputDevice !== undefined) {
+			this.#config = {
+				...this.#config,
+				inputDevice: prefs.inputDevice ?? undefined,
+			};
+		}
+	}
+
 	/**
 	 * Subscribe to lifecycle state transitions.
-	 * Hook for later slices (#13 playback, #14 conversational).
 	 */
 	onStateChange(handler: StateChangeHandler): Unsubscribe {
 		this.#stateHandlers.add(handler);
@@ -282,7 +391,6 @@ export class VoiceSession {
 
 	/**
 	 * Subscribe to transcript events (partial + final + speech markers).
-	 * Hook for later slices (partial widget, conversational tools).
 	 */
 	onTranscript(handler: TranscriptHandler): Unsubscribe {
 		this.#transcriptHandlers.add(handler);
@@ -294,7 +402,7 @@ export class VoiceSession {
 	/**
 	 * Gate mic audio without tearing down capture or the WS.
 	 * Used on `agent_start` to reduce self-noise while pi is working;
-	 * also a hook for playback self-echo mitigation (#13).
+	 * also a hook for playback self-echo mitigation (#13 / #14).
 	 */
 	setCapturePaused(paused: boolean): void {
 		if (this.#capturePaused === paused) return;
@@ -315,6 +423,7 @@ export class VoiceSession {
 		this.#agentBusy = busy;
 		if (busy) {
 			// Agent work wins over TTS — stop speak-back so tools aren't talked over.
+			this.#clearEchoGuardTimer();
 			this.#playback.stop();
 			this.setCapturePaused(true);
 		} else if (this.#state === "listening" && !this.#speaking) {
@@ -381,9 +490,14 @@ export class VoiceSession {
 		this.#error = undefined;
 		this.#authMode = undefined;
 		this.#capturePaused = false;
+		this.#reconnecting = false;
+		this.#reconnectAttempts = 0;
+		this.#clearSessionLimitTimer();
+		this.#clearEchoGuardTimer();
 		this.#resetHearingState();
 		this.#setState("connecting");
 		this.#pushUiStatus();
+		this.#pushPartialWidget();
 
 		let client: RealtimeClientLike | undefined;
 		let capture: MicCaptureLike | undefined;
@@ -428,7 +542,8 @@ export class VoiceSession {
 					const detail = tail
 						? `mic exited (${info.code ?? info.signal}): ${tail}`
 						: `mic exited (${info.code ?? info.signal ?? "?"})`;
-					void this.#handleUnexpectedClose(detail, gen);
+					// Mic death is not a soft WS reconnect — full stop.
+					void this.#failAndStop(detail, gen);
 				});
 			}
 
@@ -464,21 +579,25 @@ export class VoiceSession {
 				return;
 			}
 
+			this.#reconnectAttempts = 0;
 			this.#setState("listening");
+			this.#armSessionLimitTimer(gen);
 			const deviceNote = this.#config.inputDevice
 				? ` · in=${this.#config.inputDevice}`
 				: "";
 			this.#notify(
-				`voice listening (${auth.mode} · ${this.#config.mode}${deviceNote}) — speak anytime; footer shows hearing/partials`,
+				`voice listening (${auth.mode} · ${this.#config.mode}${deviceNote}) — speak anytime; ctrl+shift+v toggles`,
 				"info",
 			);
 			this.#pushUiStatus();
+			this.#pushPartialWidget();
 		} catch (err) {
 			if (gen !== this.#generation) return;
 			const message = errorMessage(err);
 			this.#clearClientSubs();
 			this.#client = undefined;
 			this.#capture = undefined;
+			this.#clearSessionLimitTimer();
 			await this.#teardownResources(client, capture);
 			this.#authMode = undefined;
 			this.#capturePaused = false;
@@ -489,6 +608,7 @@ export class VoiceSession {
 			this.#pushUiStatus();
 			// Return to idle after surfacing the error so `/voice start` can retry.
 			this.#setState("idle");
+			this.#pushUiStatus(true);
 			throw err instanceof Error ? err : new Error(message);
 		}
 	}
@@ -506,9 +626,13 @@ export class VoiceSession {
 		}
 
 		const gen = ++this.#generation;
+		this.#reconnecting = false;
+		this.#clearSessionLimitTimer();
+		this.#clearEchoGuardTimer();
 		this.#playback.stop();
 		this.#setState("stopping");
 		this.#pushUiStatus();
+		this.#pushPartialWidget();
 
 		const client = this.#client;
 		const capture = this.#capture;
@@ -521,6 +645,7 @@ export class VoiceSession {
 
 		this.#authMode = undefined;
 		this.#capturePaused = false;
+		this.#reconnectAttempts = 0;
 		this.#resetHearingState();
 		this.#error = undefined;
 		this.#setState("idle");
@@ -535,7 +660,11 @@ export class VoiceSession {
 	async toggle(
 		options: VoiceSessionStartOptions = {},
 	): Promise<"started" | "stopped"> {
-		if (this.#state === "listening" || this.#state === "connecting") {
+		if (
+			this.#state === "listening" ||
+			this.#state === "connecting" ||
+			this.#reconnecting
+		) {
 			await this.stop();
 			return "stopped";
 		}
@@ -558,6 +687,33 @@ export class VoiceSession {
 		}
 	}
 
+	#onSpeakingChange(speaking: boolean): void {
+		this.#speaking = speaking;
+		this.#clearEchoGuardTimer();
+		if (speaking) {
+			this.setCapturePaused(true);
+		} else if (this.#state === "listening" && !this.#agentBusy) {
+			// Barge-in: user already talking — resume immediately.
+			if (this.#hearing) {
+				this.setCapturePaused(false);
+			} else {
+				// Hold mic closed briefly so TTS tail / room echo isn't transcribed.
+				this.#echoGuardTimer = this.#scheduler.set(() => {
+					this.#echoGuardTimer = undefined;
+					if (
+						this.#state === "listening" &&
+						!this.#agentBusy &&
+						!this.#speaking
+					) {
+						this.setCapturePaused(false);
+					}
+					this.#pushUiStatus();
+				}, ECHO_GUARD_AFTER_TTS_MS);
+			}
+		}
+		this.#pushUiStatus();
+	}
+
 	#wireClient(client: RealtimeClientLike, gen: number): void {
 		this.#clearClientSubs();
 
@@ -566,7 +722,13 @@ export class VoiceSession {
 			const event = args[0] as TranscriptEvent | undefined;
 			if (!event) return;
 			this.#hearing = false;
+			const finalText = event.text?.trim() ?? "";
 			this.#partial = "";
+			if (finalText) {
+				this.#lastFinal = finalText;
+				this.#lastFinalAt = Date.now();
+				this.#armFinalWidgetTimer(gen);
+			}
 			this.#emitTranscript(event);
 			this.#handleFinalTranscript(event);
 			this.#pushUiStatus();
@@ -594,10 +756,15 @@ export class VoiceSession {
 			const event = args[0] as TranscriptEvent | undefined;
 			if (!event) return;
 			if (event.type === "speech_started") {
-				// Barge-in lite: stop speak-back when the user starts a new utterance.
-				this.#playback.stop();
+				// Mark hearing before stop() so echo-guard resumes immediately.
 				this.#hearing = true;
 				this.#partial = "";
+				this.#clearEchoGuardTimer();
+				// Barge-in lite: stop speak-back when the user starts a new utterance.
+				this.#playback.stop();
+				if (!this.#agentBusy && this.#state === "listening") {
+					this.setCapturePaused(false);
+				}
 				this.#notify("voice: hearing you…", "info");
 			} else if (event.type === "speech_stopped") {
 				this.#hearing = false;
@@ -618,8 +785,12 @@ export class VoiceSession {
 		};
 		const onClose = (...args: unknown[]) => {
 			if (gen !== this.#generation) return;
-			// Unexpected close while live → surface and reset.
-			if (this.#state === "listening" || this.#state === "connecting") {
+			// Unexpected close while live → reconnect or stop.
+			if (
+				this.#state === "listening" ||
+				this.#state === "connecting" ||
+				this.#reconnecting
+			) {
 				const info = args[0] as
 					| { code?: number; reason?: string }
 					| undefined;
@@ -730,9 +901,121 @@ export class VoiceSession {
 		return !this.#agentBusy;
 	}
 
+	/**
+	 * Soft-reconnect on unexpected WS drop (network blip / 60m limit).
+	 * Keeps mic capture alive when possible; only the Realtime client is swapped.
+	 */
 	async #handleUnexpectedClose(message: string, gen: number): Promise<void> {
 		if (gen !== this.#generation) return;
+		if (this.#state === "stopping" || this.#state === "idle") return;
+		if (this.#reconnecting) return;
+
+		this.#playback.stop();
+		this.#clearSessionLimitTimer();
+		this.#clearEchoGuardTimer();
+
+		// Drop the dead client (subs first so our own close is ignored).
+		const oldClient = this.#client;
+		this.#client = undefined;
+		this.#clearClientSubs();
+		if (oldClient) {
+			try {
+				oldClient.close();
+			} catch {
+				// ignore
+			}
+		}
+
+		// Attempt soft reconnect while capture is still running.
+		if (
+			this.#capture &&
+			this.#reconnectAttempts < MAX_RECONNECT_ATTEMPTS
+		) {
+			this.#reconnecting = true;
+			this.#setState("connecting");
+			this.#pushUiStatus();
+			this.#pushPartialWidget();
+
+			while (
+				this.#reconnectAttempts < MAX_RECONNECT_ATTEMPTS &&
+				gen === this.#generation
+			) {
+				this.#reconnectAttempts += 1;
+				const attempt = this.#reconnectAttempts;
+				this.#notify(
+					`voice: connection lost (${message}) — reconnecting ${attempt}/${MAX_RECONNECT_ATTEMPTS}…`,
+					"warning",
+				);
+				this.#pushUiStatus();
+				this.#pushPartialWidget();
+
+				await this.#delay(RECONNECT_BASE_DELAY_MS * attempt);
+				if (gen !== this.#generation) {
+					this.#reconnecting = false;
+					return;
+				}
+
+				try {
+					await this.#reconnectClient(gen);
+					this.#reconnecting = false;
+					this.#reconnectAttempts = 0;
+					this.#error = undefined;
+					this.#setState("listening");
+					this.#armSessionLimitTimer(gen);
+					this.#notify("voice: reconnected", "info");
+					this.#pushUiStatus();
+					this.#pushPartialWidget();
+					return;
+				} catch (err) {
+					// loop for another attempt
+					this.#error = errorMessage(err);
+				}
+			}
+
+			this.#reconnecting = false;
+			message = `reconnect failed after ${MAX_RECONNECT_ATTEMPTS} attempts: ${this.#error ?? message}`;
+		}
+
+		await this.#failAndStop(message, gen);
+	}
+
+	/** Re-auth + new WS; leaves capture running. */
+	async #reconnectClient(gen: number): Promise<void> {
+		if (gen !== this.#generation) {
+			throw new Error("reconnect aborted");
+		}
+		const auth = await this.#resolveAuth({
+			prefer: this.#config.auth,
+			codexHome: this.#config.codexHome,
+			apiKey: this.#config.apiKey,
+		});
+		if (gen !== this.#generation) {
+			throw new Error("reconnect aborted");
+		}
+		this.#authMode = auth.mode;
+		const client = this.#createClient();
+		this.#client = client;
+		this.#wireClient(client, gen);
+		await client.connect(auth.headers, connectConfigFromVoice(this.#config));
+		if (gen !== this.#generation) {
+			this.#clearClientSubs();
+			this.#client = undefined;
+			try {
+				client.close();
+			} catch {
+				// ignore
+			}
+			throw new Error("reconnect aborted");
+		}
+	}
+
+	/** Full teardown after unrecoverable close / mic death. */
+	async #failAndStop(message: string, gen: number): Promise<void> {
+		if (gen !== this.#generation) return;
 		this.#generation++;
+		this.#reconnecting = false;
+		this.#clearSessionLimitTimer();
+		this.#clearEchoGuardTimer();
 		this.#playback.stop();
 		const client = this.#client;
 		const capture = this.#capture;
@@ -743,12 +1026,75 @@ export class VoiceSession {
 		this.#error = message;
 		this.#authMode = undefined;
 		this.#capturePaused = false;
+		this.#reconnectAttempts = 0;
 		this.#resetHearingState();
 		this.#setState("error");
-		this.#notify(`voice error: ${message}`, "error");
+		this.#notify(`voice error: ${message} — voice stopped`, "error");
 		this.#pushUiStatus();
 		this.#setState("idle");
 		this.#pushUiStatus(true);
+	}
+
+	/** Proactive refresh before the Realtime ~60-minute session limit. */
+	#armSessionLimitTimer(gen: number): void {
+		this.#clearSessionLimitTimer();
+		this.#sessionLimitTimer = this.#scheduler.set(() => {
+			this.#sessionLimitTimer = undefined;
+			void this.#refreshBeforeSessionLimit(gen);
+		}, SESSION_LIMIT_REFRESH_MS);
+	}
+
+	#clearSessionLimitTimer(): void {
+		if (this.#sessionLimitTimer !== undefined) {
+			this.#scheduler.clear(this.#sessionLimitTimer);
+			this.#sessionLimitTimer = undefined;
+		}
+	}
+
+	async #refreshBeforeSessionLimit(gen: number): Promise<void> {
+		if (gen !== this.#generation) return;
+		if (this.#state !== "listening" || this.#reconnecting) return;
+		this.#notify(
+			"voice: refreshing realtime session before 60-minute limit…",
+			"info",
+		);
+		// Synthesize a soft reconnect via the same path as a WS drop.
+		// Detach current client without going through fail.
+		const oldClient = this.#client;
+		this.#client = undefined;
+		this.#clearClientSubs();
+		if (oldClient) {
+			try {
+				oldClient.close();
+			} catch {
+				// ignore
+			}
+		}
+		// Reset attempt counter for a clean refresh.
+		this.#reconnectAttempts = 0;
+		await this.#handleUnexpectedClose("session time limit refresh", gen);
+	}
+
+	#armFinalWidgetTimer(gen: number): void {
+		if (this.#finalWidgetTimer !== undefined) {
+			this.#scheduler.clear(this.#finalWidgetTimer);
+			this.#finalWidgetTimer = undefined;
+		}
+		this.#finalWidgetTimer = this.#scheduler.set(() => {
+			this.#finalWidgetTimer = undefined;
+			if (gen !== this.#generation) return;
+			// Only clear the lingering final if nothing new is showing.
+			if (!this.#partial.trim() && !this.#hearing) {
+				this.#pushPartialWidget();
+			}
+		}, FINAL_WIDGET_MS);
+	}
+
+	#clearEchoGuardTimer(): void {
+		if (this.#echoGuardTimer !== undefined) {
+			this.#scheduler.clear(this.#echoGuardTimer);
+			this.#echoGuardTimer = undefined;
+		}
 	}
 
 	async #teardownResources(
@@ -782,11 +1128,17 @@ export class VoiceSession {
 	#resetHearingState(): void {
 		this.#hearing = false;
 		this.#partial = "";
+		this.#lastFinal = "";
+		this.#lastFinalAt = 0;
 		this.#audioChunks = 0;
 		this.#audioLevel = 0;
 		this.#lastLevelUiAt = 0;
 		this.#hadAudible = false;
 		this.#captureBackend = undefined;
+		if (this.#finalWidgetTimer !== undefined) {
+			this.#scheduler.clear(this.#finalWidgetTimer);
+			this.#finalWidgetTimer = undefined;
+		}
 		this.#pushPartialWidget(true);
 	}
 
@@ -806,17 +1158,50 @@ export class VoiceSession {
 		}
 	}
 
+	/**
+	 * Transcript widget above the editor.
+	 * Shows connecting/reconnect state, live partials, and a brief final flash.
+	 */
 	#pushPartialWidget(clear = false): void {
 		const ui = this.#ui;
 		if (!ui?.setWidget) return;
 		try {
-			if (clear || !this.#partial.trim()) {
+			if (
+				clear ||
+				this.#state === "idle" ||
+				this.#state === "stopping" ||
+				this.#state === "error"
+			) {
 				ui.setWidget("voice-partial", undefined);
 				return;
 			}
-			ui.setWidget("voice-partial", [
-				`voice ▸ ${truncate(this.#partial.trim(), 100)}`
-			]);
+
+			const lines: string[] = [];
+			if (this.#reconnecting) {
+				lines.push(
+					`voice ↻ reconnecting (${this.#reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})…`,
+				);
+			} else if (this.#state === "connecting") {
+				lines.push("voice ↻ connecting…");
+			}
+
+			const partial = this.#partial.trim();
+			if (partial) {
+				lines.push(`voice ▸ ${truncate(partial, 100)}`);
+			} else if (this.#hearing) {
+				lines.push("voice ▸ …");
+			} else if (
+				this.#lastFinal &&
+				Date.now() - this.#lastFinalAt < FINAL_WIDGET_MS
+			) {
+				lines.push(`voice ✓ ${truncate(this.#lastFinal, 100)}`);
+			}
+
+			if (lines.length === 0) {
+				ui.setWidget("voice-partial", undefined);
+				return;
+			}
+			ui.setWidget("voice-partial", lines.slice(0, 2));
 		} catch {
 			// UI optional
 		}
@@ -840,6 +1225,7 @@ export class VoiceSession {
 		}
 	}
 }
+
 function truncate(text: string, max: number): string {
 	if (text.length <= max) return text;
 	return `${text.slice(0, Math.max(0, max - 1))}…`;

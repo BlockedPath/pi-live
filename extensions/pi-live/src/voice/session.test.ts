@@ -1,5 +1,5 @@
 /**
- * Unit tests for VoiceSession state machine (VS5 / #12 + VS6 / #13).
+ * Unit tests for VoiceSession state machine (VS5–VS7 / #12–#14).
  * Fake auth / client / capture / bridge / playback — no network, no mic.
  *
  * Run: npm test
@@ -42,6 +42,7 @@ class FakeClient implements RealtimeClientLike {
 		this.headers = authHeaders;
 		this.config = config;
 		this.connected = true;
+		this.closed = false;
 		return Promise.resolve();
 	}
 
@@ -49,6 +50,13 @@ class FakeClient implements RealtimeClientLike {
 		this.closed = true;
 		this.connected = false;
 		this.#emit("close", { code: 1000, reason: "client close" });
+	}
+
+	/** Unexpected drop (does not go through close() semantics for tests). */
+	drop(code = 1006, reason = "abnormal closure"): void {
+		this.closed = true;
+		this.connected = false;
+		this.#emit("close", { code, reason });
 	}
 
 	appendAudio(pcm: string | Uint8Array): void {
@@ -74,6 +82,15 @@ class FakeClient implements RealtimeClientLike {
 			timestamp: Date.now(),
 		};
 		this.#emit("transcript.done", event);
+	}
+
+	emitTranscriptDelta(text: string): void {
+		const event: TranscriptEvent = {
+			type: "partial",
+			text,
+			timestamp: Date.now(),
+		};
+		this.#emit("transcript.delta", event);
 	}
 
 	emitSpeech(kind: "started" | "stopped"): void {
@@ -139,25 +156,42 @@ function makeSession(overrides?: {
 	failConnect?: Error;
 	tts?: "say" | "openai" | "off";
 	playback?: VoicePlayback;
+	/** Fresh client per createClient call (reconnect tests). */
+	freshClients?: boolean;
+	/** Override delay (default: immediate). */
+	delay?: (ms: number) => Promise<void>;
+	/** Hold scheduled timers instead of running immediately. */
+	holdTimers?: boolean;
 }): {
 	session: VoiceSession;
 	client: FakeClient;
 	capture: FakeCapture;
+	clients: FakeClient[];
 	delivered: string[];
 	uiLines: string[];
 	statuses: Array<string | undefined>;
+	widgets: Array<string[] | undefined>;
+	flushTimers: () => void;
 } {
-	const client = overrides?.client ?? new FakeClient();
+	const clients: FakeClient[] = [];
 	const capture = overrides?.capture ?? new FakeCapture();
 	const delivered: string[] = [];
 	const uiLines: string[] = [];
 	const statuses: Array<string | undefined> = [];
+	const widgets: Array<string[] | undefined> = [];
+	const pendingTimers: Array<() => void> = [];
 
-	if (overrides?.failConnect) {
-		const err = overrides.failConnect;
-		client.connect = async () => {
-			throw err;
-		};
+	// Eager default client so destructuring `{ client }` before start() is stable.
+	let defaultClient: FakeClient | undefined = overrides?.client;
+	if (!overrides?.freshClients) {
+		if (!defaultClient) defaultClient = new FakeClient();
+		clients.push(defaultClient);
+		if (overrides?.failConnect) {
+			const err = overrides.failConnect;
+			defaultClient.connect = async () => {
+				throw err;
+			};
+		}
 	}
 
 	const ui: VoiceSessionUi = {
@@ -167,7 +201,37 @@ function makeSession(overrides?: {
 		setStatus: (_key, text) => {
 			statuses.push(text);
 		},
+		setWidget: (_key, content) => {
+			widgets.push(content);
+		},
 	};
+
+	const delay =
+		overrides?.delay ??
+		(async () => {
+			/* immediate reconnect backoff in tests */
+		});
+
+	const scheduler = overrides?.holdTimers
+		? {
+				set: (fn: () => void, ms: number) => {
+					if (ms > 10_000) return { long: true, ms };
+					pendingTimers.push(fn);
+					return pendingTimers.length;
+				},
+				clear: (_id: unknown) => {
+					/* leave pending; tests flush selectively */
+				},
+		  }
+		: {
+				set: (fn: () => void, ms: number) => {
+					// Never auto-fire long timers (session-limit refresh is 55m).
+					if (ms > 10_000) return { long: true, ms };
+					queueMicrotask(fn);
+					return 1;
+				},
+				clear: (_id: unknown) => undefined,
+		  };
 
 	const session = new VoiceSession({
 		config: {
@@ -178,17 +242,41 @@ function makeSession(overrides?: {
 			if (overrides?.failAuth) throw overrides.failAuth;
 			return overrides?.auth ?? fakeAuth();
 		},
-		createClient: () => client,
+		createClient: () => {
+			if (overrides?.freshClients) {
+				const c = new FakeClient();
+				clients.push(c);
+				return c;
+			}
+			return defaultClient!;
+		},
 		createCapture: () => capture,
 		deliverText: (_pi, text) => {
 			delivered.push(text);
 			overrides?.deliver?.(text);
 		},
 		createPlayback: overrides?.playback ? () => overrides.playback! : undefined,
+		delay,
+		scheduler,
 	});
 	session.bindUi(ui);
 
-	return { session, client, capture, delivered, uiLines, statuses };
+	return {
+		session,
+		get client(): FakeClient {
+			return clients[0] ?? defaultClient!;
+		},
+		capture,
+		clients,
+		delivered,
+		uiLines,
+		statuses,
+		widgets,
+		flushTimers: () => {
+			const batch = pendingTimers.splice(0, pendingTimers.length);
+			for (const fn of batch) fn();
+		},
+	};
 }
 
 describe("VoiceSession", () => {
@@ -243,7 +331,7 @@ describe("VoiceSession", () => {
 		assert.match(session.getStatus(), /listening/);
 
 		session.setCapturePaused(true);
-		assert.equal(session.getStatus(), "pi working…");
+		assert.equal(session.getStatus(), "paused…");
 		capture.push(chunk);
 		// Paused: still meters mic, does not stream.
 		assert.equal(client.appended.length, 1);
@@ -388,7 +476,8 @@ describe("VoiceSession", () => {
 		session.stopPlayback();
 		await speakPromise;
 		assert.equal(session.isSpeaking(), false);
-		// Agent not busy → capture resumes.
+		// Echo-guard timer resumes capture on microtask (test scheduler).
+		await new Promise<void>((r) => queueMicrotask(r));
 		assert.equal(session.isCapturePaused(), false);
 	});
 
@@ -423,5 +512,118 @@ describe("VoiceSession", () => {
 		client.emitSpeech("started");
 		await speakPromise;
 		assert.equal(session.isSpeaking(), false);
+	});
+
+	it("applyPrefs updates mode/tts/device snapshot", () => {
+		const { session } = makeSession();
+		session.applyPrefs({
+			v: 1,
+			mode: "transcription",
+			tts: "say",
+			voice: "Samantha",
+			inputDevice: "iPhone Microphone",
+		});
+		const prefs = session.getPrefs();
+		assert.equal(prefs.tts, "say");
+		assert.equal(prefs.voice, "Samantha");
+		assert.equal(prefs.inputDevice, "iPhone Microphone");
+		assert.equal(session.getConfig().tts, "say");
+		assert.equal(session.getStatusInfo().tts, "say");
+	});
+
+	it("partial + final appear in the transcript widget", async () => {
+		const { session, client, widgets } = makeSession();
+		await session.start({ pi: { sendUserMessage: () => undefined } });
+		client.emitTranscriptDelta("hello ");
+		client.emitTranscriptDelta("world");
+		const partialWidget = widgets.filter(Boolean).at(-1);
+		assert.ok(partialWidget?.some((line) => line.includes("hello world")));
+		assert.ok(partialWidget?.some((line) => line.includes("▸")));
+
+		client.emitTranscriptDone("hello world");
+		const finalWidget = widgets.filter(Boolean).at(-1);
+		assert.ok(finalWidget?.some((line) => line.includes("✓") && line.includes("hello world")));
+		assert.equal(session.getStatusInfo().partial, undefined);
+	});
+
+	it("reconnects after unexpected WS drop and keeps capture", async () => {
+		const { session, capture, clients, uiLines } = makeSession({
+			freshClients: true,
+		});
+		await session.start({ pi: { sendUserMessage: () => undefined } });
+		assert.equal(session.getState(), "listening");
+		assert.equal(capture.started, true);
+		const live = clients[0];
+		assert.ok(live, "expected a live client after start");
+
+		// Drop the live client; soft reconnect should spin a fresh one.
+		live.drop(1006, "going away");
+		// Allow reconnect loop promises to settle.
+		await new Promise((r) => setTimeout(r, 30));
+
+		assert.equal(session.getState(), "listening");
+		assert.equal(session.isReconnecting(), false);
+		assert.equal(capture.stopped, false);
+		assert.ok(clients.length >= 2, "expected a new client for reconnect");
+		assert.equal(clients.at(-1)?.connected, true);
+		assert.ok(uiLines.some((l) => /reconnected/i.test(l)));
+	});
+
+	it("stops with a clear error after reconnect budget is exhausted", async () => {
+		let connects = 0;
+		const first = new FakeClient();
+		const capture = new FakeCapture();
+		const uiLines: string[] = [];
+		const session = new VoiceSession({
+			config: { ...defaultVoiceConfig, tts: "off" },
+			resolveAuth: async () => fakeAuth(),
+			createClient: () => {
+				connects += 1;
+				if (connects === 1) return first;
+				const c = new FakeClient();
+				c.connect = async () => {
+					throw new Error("still down");
+				};
+				return c;
+			},
+			createCapture: () => capture,
+			deliverText: () => undefined,
+			delay: async () => undefined,
+		});
+		session.bindUi({
+			notify: (m) => uiLines.push(m),
+		});
+		await session.start({ pi: { sendUserMessage: () => undefined } });
+		assert.equal(session.getState(), "listening");
+
+		first.drop(1006, "network blip");
+		await new Promise((r) => setTimeout(r, 40));
+
+		assert.equal(session.getState(), "idle");
+		assert.ok(
+			uiLines.some((l) => /reconnect failed|voice error/i.test(l)),
+			`expected failure notify, got: ${uiLines.join(" | ")}`,
+		);
+		assert.ok(connects >= 2);
+	});
+
+	it("echo guard holds capture briefly after TTS ends", async () => {
+		const hanging = hangingPlayback();
+		const { session, flushTimers } = makeSession({
+			tts: "say",
+			playback: hanging,
+			holdTimers: true,
+		});
+		await session.start({ pi: { sendUserMessage: () => undefined } });
+		const speakPromise = session.speakBack("Done.");
+		await new Promise((r) => setTimeout(r, 20));
+		assert.equal(session.isCapturePaused(), true);
+		session.stopPlayback();
+		await speakPromise;
+		// Still paused until echo-guard timer fires.
+		assert.equal(session.isCapturePaused(), true);
+		assert.match(session.getStatus(), /echo guard|paused/);
+		flushTimers();
+		assert.equal(session.isCapturePaused(), false);
 	});
 });
