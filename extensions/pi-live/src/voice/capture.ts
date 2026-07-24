@@ -151,6 +151,9 @@ export class MicCapture implements MicCaptureLike {
 	#onChunk: ((pcm: Buffer) => void) | null = null;
 	/** Leftover byte when a chunk ends on an odd boundary (PCM16 = 2 bytes/sample). */
 	#pending: Buffer | null = null;
+	#stderrBuf = "";
+	#onUnexpectedExit: ((info: { code: number | null; signal: string | null; stderr: string }) => void) | null =
+		null;
 
 	constructor(options: MicCaptureOptions = {}) {
 		const rate = options.sampleRate ?? DEFAULT_SAMPLE_RATE;
@@ -182,6 +185,21 @@ export class MicCapture implements MicCaptureLike {
 		return this.#child !== null && this.#stopping === null;
 	}
 
+	/** Recent stderr from the capture process (truncated). */
+	get lastStderr(): string {
+		return this.#stderrBuf;
+	}
+
+	/**
+	 * Optional hook when the capture process dies unexpectedly after a successful start.
+	 * Not called during an intentional {@link stop}.
+	 */
+	onUnexpectedExit(
+		handler: ((info: { code: number | null; signal: string | null; stderr: string }) => void) | null,
+	): void {
+		this.#onUnexpectedExit = handler;
+	}
+
 	/**
 	 * Begin streaming mic PCM to `onChunk`.
 	 * No-op if already capturing. Rejects with an install hint if sox/rec is missing.
@@ -202,6 +220,7 @@ export class MicCapture implements MicCaptureLike {
 		this.#backendLabel = backend.label;
 		this.#onChunk = onChunk;
 
+		this.#stderrBuf = "";
 		const child = spawn(backend.command, backend.args, {
 			stdio: ["ignore", "pipe", "pipe"],
 			// Detach from a controlling TTY so SoX device prompts don't steal input.
@@ -213,6 +232,10 @@ export class MicCapture implements MicCaptureLike {
 
 		child.stdout.on("data", (chunk: Buffer) => {
 			this.#emitPcm(chunk);
+		});
+		child.stderr.on("data", (chunk: Buffer) => {
+			const text = chunk.toString("utf8");
+			this.#stderrBuf = `${this.#stderrBuf}${text}`.slice(-2000);
 		});
 
 		// Surface spawn-time failures (ENOENT etc.) before we resolve.
@@ -239,15 +262,24 @@ export class MicCapture implements MicCaptureLike {
 			};
 
 			// If the process exits immediately, treat it as a failure to start.
-			const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+			const onExit = (
+				code: number | null,
+				signal: NodeJS.Signals | null,
+			): void => {
 				if (settled) return;
 				settled = true;
 				cleanup();
+				const errTail = this.#stderrBuf.trim();
 				this.#cleanupChild();
 				let detail = "unknown reason";
 				if (code !== null) detail = `exit code ${code}`;
 				else if (signal) detail = `signal ${signal}`;
-				reject(new Error(`mic capture failed to start (${backend.label}: ${detail})`));
+				const extra = errTail ? `: ${errTail.slice(-300)}` : "";
+				reject(
+					new Error(
+						`mic capture failed to start (${backend.label}: ${detail})${extra}`,
+					),
+				);
 			};
 
 			const cleanup = (): void => {
@@ -269,9 +301,21 @@ export class MicCapture implements MicCaptureLike {
 
 		// After a successful start, clear child state when the process ends so
 		// a later start() can respawn without an explicit stop().
-		child.once("exit", () => {
-			if (this.#child === child) {
-				this.#cleanupChild();
+		child.once("exit", (code, signal) => {
+			if (this.#child !== child) return;
+			const intentional = this.#stopping !== null;
+			const stderr = this.#stderrBuf;
+			this.#cleanupChild();
+			if (!intentional) {
+				try {
+					this.#onUnexpectedExit?.({
+						code,
+						signal,
+						stderr,
+					});
+				} catch {
+					// ignore listener errors
+				}
 			}
 		});
 		child.once("error", () => {

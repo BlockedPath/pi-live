@@ -341,17 +341,28 @@ export class VoiceSession {
 				device: this.#config.inputDevice,
 			});
 			this.#capture = capture;
-			this.#captureBackend =
-				"backend" in capture && typeof (capture as { backend?: unknown }).backend === "string"
-					? (capture as { backend: string }).backend
-					: this.#config.inputDevice
-						? `device:${this.#config.inputDevice}`
-						: "default";
+
+			// Surface unexpected capture death (e.g. Continuity drop).
+			if (
+				capture &&
+				"onUnexpectedExit" in capture &&
+				typeof (capture as MicCapture).onUnexpectedExit === "function"
+			) {
+				(capture as MicCapture).onUnexpectedExit((info) => {
+					if (gen !== this.#generation) return;
+					const tail = info.stderr?.trim().slice(-200);
+					const detail = tail
+						? `mic exited (${info.code ?? info.signal}): ${tail}`
+						: `mic exited (${info.code ?? info.signal ?? "?"})`;
+					void this.#handleUnexpectedClose(detail, gen);
+				});
+			}
+
 			await capture.start((pcm) => {
 				if (gen !== this.#generation) return;
-				if (this.#state !== "listening") return;
-				// Always sample mic health (even while paused).
+				// Meter whenever capture is alive (including connecting).
 				this.#noteAudio(pcm);
+				if (this.#state !== "listening") return;
 				if (this.#capturePaused) return;
 				const active = this.#client;
 				if (!active) return;
@@ -361,6 +372,15 @@ export class VoiceSession {
 					// Drop chunk on transient send failure; close handler recovers.
 				}
 			});
+
+			// Backend label is only meaningful after start().
+			this.#captureBackend =
+				"backend" in capture &&
+				typeof (capture as { backend?: unknown }).backend === "string"
+					? (capture as { backend: string }).backend
+					: this.#config.inputDevice
+						? `device:${this.#config.inputDevice}`
+						: "default";
 			if (gen !== this.#generation) {
 				this.#clearClientSubs();
 				this.#client = undefined;
