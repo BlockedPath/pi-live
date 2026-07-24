@@ -77,6 +77,10 @@ export interface VoiceSessionStatus {
 	audioChunks?: number;
 	/** 0–1 rough input level from recent PCM (silence ≈ 0). */
 	audioLevel?: number;
+	/** Named input device when set (`PI_VOICE_INPUT_DEVICE`). */
+	inputDevice?: string;
+	/** Capture backend label (`rec`, `sox:coreaudio:…`). */
+	captureBackend?: string;
 	/** Present when `state === "error"`. */
 	error?: string;
 }

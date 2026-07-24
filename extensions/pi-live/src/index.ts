@@ -2,7 +2,7 @@
  * pi-live extension — demo skeleton + voice transcription MVP (VS5 / #12).
  *
  * Install locally (one of):
- *   - `pi install ./extensions/pi-live`        (treats this dir as a pi package)
+ *   - `cd extensions/pi-live && pi install .`
  *   - copy/symlink this directory into `.pi/extensions/` and run `/reload`
  *   - quick test: `pi -e ./src/index.ts`
  *
@@ -11,6 +11,7 @@
  * Voice MVP: `/voice start|stop|status` (toggle with bare `/voice`).
  * Auth via Codex OAuth (`~/.codex`) or API key; mic via sox/rec; transcripts
  * bridge into pi via `sendUserMessage`.
+ * Optional input device: `PI_VOICE_INPUT_DEVICE='iPhone Microphone'`.
  */
 
 import { Type } from "@earendil-works/pi-ai";
@@ -52,6 +53,8 @@ function formatVoiceStatus(): string {
 	);
 	if (info.capturePaused) parts.push("capture=paused");
 	if (info.hearing) parts.push("hearing=yes");
+	if (info.inputDevice) parts.push(`in=${info.inputDevice}`);
+	if (info.captureBackend) parts.push(`backend=${info.captureBackend}`);
 	if (typeof info.audioChunks === "number") {
 		parts.push(`micChunks=${info.audioChunks}`);
 	}

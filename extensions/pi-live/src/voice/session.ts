@@ -59,7 +59,7 @@ export interface VoiceSessionDeps {
 		apiKey?: string;
 	}) => Promise<VoiceAuth>;
 	createClient?: () => RealtimeClientLike;
-	createCapture?: (sampleRate: number) => MicCaptureLike;
+	createCapture?: (opts: { sampleRate: number; device?: string }) => MicCaptureLike;
 	deliverText?: (
 		pi: VoiceBridgePi,
 		text: string,
@@ -124,6 +124,7 @@ export class VoiceSession {
 	#audioLevel = 0;
 	#lastLevelUiAt = 0;
 	#hadAudible = false;
+	#captureBackend: string | undefined;
 
 	readonly #stateHandlers = new Set<StateChangeHandler>();
 	readonly #transcriptHandlers = new Set<TranscriptHandler>();
@@ -140,7 +141,12 @@ export class VoiceSession {
 				}));
 		this.#createClient = deps.createClient ?? (() => new RealtimeClient());
 		this.#createCapture =
-			deps.createCapture ?? ((sampleRate) => new MicCapture({ sampleRate }));
+			deps.createCapture ??
+			((opts) =>
+				new MicCapture({
+					sampleRate: opts.sampleRate,
+					device: opts.device,
+				}));
 		this.#deliverText = deps.deliverText ?? deliverVoiceText;
 	}
 
@@ -208,6 +214,8 @@ export class VoiceSession {
 			partial: this.#partial || undefined,
 			audioChunks: this.#audioChunks,
 			audioLevel: this.#audioLevel,
+			inputDevice: this.#config.inputDevice,
+			captureBackend: this.#captureBackend,
 			error: this.#error,
 		};
 	}
@@ -328,8 +336,17 @@ export class VoiceSession {
 				return;
 			}
 
-			capture = this.#createCapture(this.#config.sampleRate);
+			capture = this.#createCapture({
+				sampleRate: this.#config.sampleRate,
+				device: this.#config.inputDevice,
+			});
 			this.#capture = capture;
+			this.#captureBackend =
+				"backend" in capture && typeof (capture as { backend?: unknown }).backend === "string"
+					? (capture as { backend: string }).backend
+					: this.#config.inputDevice
+						? `device:${this.#config.inputDevice}`
+						: "default";
 			await capture.start((pcm) => {
 				if (gen !== this.#generation) return;
 				if (this.#state !== "listening") return;
@@ -354,8 +371,11 @@ export class VoiceSession {
 			}
 
 			this.#setState("listening");
+			const deviceNote = this.#config.inputDevice
+				? ` · in=${this.#config.inputDevice}`
+				: "";
 			this.#notify(
-				`voice listening (${auth.mode} · ${this.#config.mode}) — speak anytime; footer shows hearing/partials`,
+				`voice listening (${auth.mode} · ${this.#config.mode}${deviceNote}) — speak anytime; footer shows hearing/partials`,
 				"info",
 			);
 			this.#pushUiStatus();
@@ -640,6 +660,7 @@ export class VoiceSession {
 		this.#audioLevel = 0;
 		this.#lastLevelUiAt = 0;
 		this.#hadAudible = false;
+		this.#captureBackend = undefined;
 		this.#pushPartialWidget(true);
 	}
 

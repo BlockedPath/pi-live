@@ -2,18 +2,20 @@
  * Mic capture via CLI `sox` / `rec` (VS3 / issue #10).
  *
  * Streams PCM16 LE mono at the configured sample rate (default 24 kHz) from the
- * system default input device. No native Node addons, no browser/GUI.
+ * system default input device, or a named device via `device` /
+ * `PI_VOICE_INPUT_DEVICE` (e.g. Continuity "iPhone Microphone" on macOS).
  *
- * Requires SoX on PATH (`brew install sox` on macOS). `rec` is preferred when
- * present; otherwise `sox -d` is used.
+ * Requires SoX on PATH (`brew install sox` on macOS). `rec` is preferred for
+ * the default device; named devices use `sox -t coreaudio "…"` on Darwin.
  *
  * Manual check (optional):
- *   node --input-type=module -e "
- *     import { MicCapture } from './extensions/pi-live/src/voice/capture.ts';
- *     const m = new MicCapture();
- *     await m.start((c) => console.log('chunk', c.byteLength, m.backend));
- *     setTimeout(() => m.stop(), 2000);
- *   "
+ *   PI_VOICE_INPUT_DEVICE='iPhone Microphone' \\
+ *     node --input-type=module -e "
+ *       import { MicCapture } from './src/voice/capture.ts';
+ *       const m = new MicCapture({ device: process.env.PI_VOICE_INPUT_DEVICE });
+ *       await m.start((c) => console.log('chunk', c.byteLength, m.backend));
+ *       setTimeout(() => m.stop(), 2000);
+ *     "
  */
 
 import { type ChildProcessByStdio, spawn } from "node:child_process";
@@ -33,6 +35,11 @@ const DEFAULT_SAMPLE_RATE = defaultVoiceConfig.sampleRate;
 export interface MicCaptureOptions {
 	/** Target sample rate in Hz (SoX resamples the device if needed). */
 	sampleRate?: number;
+	/**
+	 * Named input device (macOS CoreAudio name, e.g. `iPhone Microphone`).
+	 * When set, uses `sox -t coreaudio "<name>"` instead of the default device.
+	 */
+	device?: string;
 }
 
 /**
@@ -60,13 +67,14 @@ interface Backend {
 	label: string;
 	command: string;
 	args: string[];
+	/** Device name when a non-default input was requested. */
+	device?: string;
 }
 
-function resolveBackend(sampleRate: number): Backend {
+function pcmOutputArgs(sampleRate: number): string[] {
 	const rate = String(sampleRate);
 	// signed-integer 16-bit LE mono raw PCM on stdout
-	const pcmArgs = [
-		"-q", // quiet — no progress meter on stderr
+	return [
 		"-c",
 		"1",
 		"-r",
@@ -78,12 +86,42 @@ function resolveBackend(sampleRate: number): Backend {
 		"-t",
 		"raw",
 		"-", // stdout
-	] as const;
+	];
+}
+
+function resolveBackend(sampleRate: number, device?: string): Backend {
+	const outArgs = pcmOutputArgs(sampleRate);
+	const named = device?.trim() || undefined;
+
+	// Named device: prefer sox + coreaudio on Darwin; fall back to sox -d style name.
+	if (named) {
+		const sox = findOnPath(["sox"]);
+		if (!sox) throw new Error(INSTALL_HINT);
+		if (process.platform === "darwin") {
+			return {
+				label: `sox:coreaudio:${named}`,
+				command: sox,
+				device: named,
+				args: ["-q", "-t", "coreaudio", named, ...outArgs],
+			};
+		}
+		// Non-macOS: treat name as SoX input path/device string.
+		return {
+			label: `sox:${named}`,
+			command: sox,
+			device: named,
+			args: ["-q", named, ...outArgs],
+		};
+	}
 
 	const rec = findOnPath(["rec"]);
 	if (rec) {
 		// rec ≡ sox -d: records from the default capture device.
-		return { label: "rec", command: rec, args: [...pcmArgs] };
+		return {
+			label: "rec",
+			command: rec,
+			args: ["-q", ...outArgs],
+		};
 	}
 
 	const sox = findOnPath(["sox"]);
@@ -91,7 +129,7 @@ function resolveBackend(sampleRate: number): Backend {
 		return {
 			label: "sox",
 			command: sox,
-			args: ["-q", "-d", ...pcmArgs.slice(1)],
+			args: ["-q", "-d", ...outArgs],
 		};
 	}
 
@@ -106,6 +144,7 @@ function resolveBackend(sampleRate: number): Backend {
  */
 export class MicCapture implements MicCaptureLike {
 	readonly #sampleRate: number;
+	readonly #device: string | undefined;
 	#backendLabel = "none";
 	#child: ChildProcessByStdio<null, Readable, Readable> | null = null;
 	#stopping: Promise<void> | null = null;
@@ -119,11 +158,18 @@ export class MicCapture implements MicCaptureLike {
 			throw new Error(`invalid sampleRate: ${String(options.sampleRate)}`);
 		}
 		this.#sampleRate = Math.trunc(rate);
+		const dev = options.device?.trim();
+		this.#device = dev || undefined;
 	}
 
-	/** Active capture backend (`rec`, `sox`, or `none` before first start). */
+	/** Active capture backend (`rec`, `sox`, `sox:coreaudio:…`, or `none`). */
 	get backend(): string {
 		return this.#backendLabel;
+	}
+
+	/** Configured named input device, if any. */
+	get device(): string | undefined {
+		return this.#device;
 	}
 
 	/** Configured output sample rate in Hz. */
@@ -152,7 +198,7 @@ export class MicCapture implements MicCaptureLike {
 			await this.#stopping;
 		}
 
-		const backend = resolveBackend(this.#sampleRate);
+		const backend = resolveBackend(this.#sampleRate, this.#device);
 		this.#backendLabel = backend.label;
 		this.#onChunk = onChunk;
 

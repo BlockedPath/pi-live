@@ -22,6 +22,12 @@ export interface VoiceConfig {
 	codexHome: string;
 	/** PCM sample rate in Hz (OpenAI Realtime GA default: 24000). */
 	sampleRate: number;
+	/**
+	 * Optional CoreAudio / SoX input device name.
+	 * Examples: `iPhone Microphone`, `MacBook Air Microphone`.
+	 * Empty/undefined → system default (`rec` / `sox -d`).
+	 */
+	inputDevice?: string;
 	/** Optional explicit API key override (never logged). */
 	apiKey?: string;
 }
@@ -75,6 +81,7 @@ export function loadVoiceConfig(
 		auth: parseAuth(env.PI_VOICE_AUTH?.trim()),
 		codexHome: expandHome(codexHomeRaw),
 		sampleRate: parseSampleRate(env.PI_VOICE_SAMPLE_RATE?.trim()),
+		inputDevice: env.PI_VOICE_INPUT_DEVICE?.trim() || undefined,
 		apiKey: apiKey || undefined,
 	};
 }
