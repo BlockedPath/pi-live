@@ -1,14 +1,15 @@
 /**
- * Unit tests for VoiceSession state machine (VS5 / #12).
- * Fake auth / client / capture / bridge — no network, no mic.
+ * Unit tests for VoiceSession state machine (VS5 / #12 + VS6 / #13).
+ * Fake auth / client / capture / bridge / playback — no network, no mic.
  *
  * Run: npm test
  */
-
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { describe, it } from "node:test";
 
 import { defaultVoiceConfig } from "./config.ts";
+import { VoicePlayback } from "./playback.ts";
 import {
 	getSharedVoiceSession,
 	resetSharedVoiceSession,
@@ -112,6 +113,23 @@ class FakeCapture implements MicCaptureLike {
 	}
 }
 
+/** Spawn that never exits until kill() — for speak-back timing tests. */
+function hangingPlayback(): VoicePlayback {
+	return new VoicePlayback({
+		backend: "say",
+		spawn: () => {
+			const ee = new EventEmitter() as EventEmitter & {
+				kill: () => boolean;
+			};
+			ee.kill = () => {
+				queueMicrotask(() => ee.emit("close", null, "SIGTERM"));
+				return true;
+			};
+			return ee as unknown as import("node:child_process").ChildProcess;
+		},
+	});
+}
+
 function makeSession(overrides?: {
 	client?: FakeClient;
 	capture?: FakeCapture;
@@ -119,6 +137,8 @@ function makeSession(overrides?: {
 	deliver?: (text: string) => void;
 	failAuth?: Error;
 	failConnect?: Error;
+	tts?: "say" | "openai" | "off";
+	playback?: VoicePlayback;
 }): {
 	session: VoiceSession;
 	client: FakeClient;
@@ -150,7 +170,10 @@ function makeSession(overrides?: {
 	};
 
 	const session = new VoiceSession({
-		config: { ...defaultVoiceConfig },
+		config: {
+			...defaultVoiceConfig,
+			tts: overrides?.tts ?? "off",
+		},
 		resolveAuth: async () => {
 			if (overrides?.failAuth) throw overrides.failAuth;
 			return overrides?.auth ?? fakeAuth();
@@ -161,6 +184,9 @@ function makeSession(overrides?: {
 			delivered.push(text);
 			overrides?.deliver?.(text);
 		},
+		createPlayback: overrides?.playback
+			? () => overrides.playback!
+			: undefined,
 	});
 	session.bindUi(ui);
 
@@ -267,6 +293,7 @@ describe("VoiceSession", () => {
 				...defaultVoiceConfig,
 				relayTarget: "vs5-session",
 				relayMode: "relay",
+				tts: "off",
 			},
 			resolveAuth: async () => fakeAuth(),
 			createClient: () => client,
@@ -342,5 +369,61 @@ describe("VoiceSession", () => {
 		const b = getSharedVoiceSession();
 		assert.equal(a, b);
 		resetSharedVoiceSession();
+	});
+
+	it("speakBack pauses capture and reports speaking status", async () => {
+		const hanging = hangingPlayback();
+		const { session } = makeSession({
+			tts: "say",
+			playback: hanging,
+		});
+		await session.start({ pi: { sendUserMessage: () => undefined } });
+
+		const speakPromise = session.speakBack("All done with the task.");
+		await new Promise((r) => setTimeout(r, 20));
+		assert.equal(session.isSpeaking(), true);
+		assert.equal(session.isCapturePaused(), true);
+		assert.equal(session.getStatus(), "speaking…");
+		assert.equal(session.getStatusInfo().speaking, true);
+		assert.equal(session.getStatusInfo().tts, "say");
+
+		session.stopPlayback();
+		await speakPromise;
+		assert.equal(session.isSpeaking(), false);
+		// Agent not busy → capture resumes.
+		assert.equal(session.isCapturePaused(), false);
+	});
+
+	it("speakBack is no-op when tts=off", async () => {
+		const { session } = makeSession({ tts: "off" });
+		await session.start({ pi: { sendUserMessage: () => undefined } });
+		await session.speakBack("Should not speak");
+		assert.equal(session.isSpeaking(), false);
+		assert.equal(session.isCapturePaused(), false);
+	});
+
+	it("stop ends playback", async () => {
+		const hanging = hangingPlayback();
+		const { session } = makeSession({ tts: "say", playback: hanging });
+		await session.start({ pi: { sendUserMessage: () => undefined } });
+		const speakPromise = session.speakBack("Still talking");
+		await new Promise((r) => setTimeout(r, 20));
+		assert.equal(session.isSpeaking(), true);
+		await session.stop();
+		await speakPromise;
+		assert.equal(session.isSpeaking(), false);
+		assert.equal(session.getState(), "idle");
+	});
+
+	it("speech_started stops playback (barge-in)", async () => {
+		const hanging = hangingPlayback();
+		const { session, client } = makeSession({ tts: "say", playback: hanging });
+		await session.start({ pi: { sendUserMessage: () => undefined } });
+		const speakPromise = session.speakBack("Please stop me");
+		await new Promise((r) => setTimeout(r, 20));
+		assert.equal(session.isSpeaking(), true);
+		client.emitSpeech("started");
+		await speakPromise;
+		assert.equal(session.isSpeaking(), false);
 	});
 });

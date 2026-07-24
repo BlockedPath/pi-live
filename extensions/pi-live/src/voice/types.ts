@@ -67,8 +67,12 @@ export interface VoiceSessionStatus {
 	model: string;
 	voice: string;
 	sampleRate: number;
+	/** Speak-back backend (`PI_VOICE_TTS`). */
+	tts?: string;
 	/** True when mic chunks are gated (e.g. while the agent is working). */
 	capturePaused?: boolean;
+	/** True while TTS speak-back is in progress. */
+	speaking?: boolean;
 	/** Server VAD currently detects speech. */
 	hearing?: boolean;
 	/** Latest partial transcript (may be empty). */

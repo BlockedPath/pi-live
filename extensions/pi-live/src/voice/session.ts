@@ -1,10 +1,11 @@
 /**
- * Voice session state machine (VS5 / issue #12).
+ * Voice session state machine (VS5 / issue #12 + VS6 playback / #13).
  *
  * Wires auth + realtime client + mic capture + pi bridge into a working
- * transcription loop. Public API surface leaves hooks for later slices
- * (playback #13, conversational #14): onTranscript, onStateChange,
- * setCapturePaused.
+ * transcription loop. VS6 adds optional speak-back via `playback.ts` on
+ * `speakBack()`, coordinated with `setCapturePaused` for echo reduction.
+ *
+ * Public hooks for later slices: onTranscript, onStateChange, setCapturePaused.
  *
  * State machine: idle → connecting → listening → stopping → idle (+ error)
  */
@@ -18,6 +19,11 @@ import {
 } from "./bridge.js";
 import { MicCapture } from "./capture.js";
 import { loadVoiceConfig, type VoiceConfig } from "./config.js";
+import {
+	VoicePlayback,
+	type SpawnFn,
+	type VoicePlaybackOptions,
+} from "./playback.js";
 import {
 	connectConfigFromVoice,
 	RealtimeClient,
@@ -68,6 +74,10 @@ export interface VoiceSessionDeps {
 	) => void;
 	/** Override Herdr relay (tests). Default: `herdr agent prompt <target> <text>`. */
 	relayText?: (target: string, text: string) => void;
+	/** Override / inject TTS playback (tests). */
+	createPlayback?: (options: VoicePlaybackOptions) => VoicePlayback;
+	/** Injectable spawn for default playback (tests). */
+	spawn?: SpawnFn;
 }
 
 type Unsubscribe = () => void;
@@ -101,12 +111,14 @@ export class VoiceSession {
 	readonly #createCapture: NonNullable<VoiceSessionDeps["createCapture"]>;
 	readonly #deliverText: NonNullable<VoiceSessionDeps["deliverText"]>;
 	readonly #relayText: NonNullable<VoiceSessionDeps["relayText"]>;
+	readonly #playback: VoicePlayback;
 
 	#state: VoiceSessionState = "idle";
 	#error: string | undefined;
 	#authMode: VoiceAuthMode | undefined;
 	#capturePaused = false;
 	#agentBusy = false;
+	#speaking = false;
 	/** Monotonic generation — invalidates in-flight start/stop work. */
 	#generation = 0;
 
@@ -153,6 +165,26 @@ export class VoiceSession {
 				}));
 		this.#deliverText = deps.deliverText ?? deliverVoiceText;
 		this.#relayText = deps.relayText ?? defaultHerdrRelay;
+		const playbackOpts: VoicePlaybackOptions = {
+			backend: this.#config.tts,
+			voice: this.#config.voice,
+			apiKey: this.#config.apiKey,
+			spawn: deps.spawn,
+		};
+		this.#playback =
+			deps.createPlayback?.(playbackOpts) ?? new VoicePlayback(playbackOpts);
+		this.#playback.onSpeakingChange((speaking) => {
+			this.#speaking = speaking;
+			if (speaking) {
+				this.setCapturePaused(true);
+			} else if (
+				this.#state === "listening" &&
+				!this.#agentBusy
+			) {
+				this.setCapturePaused(false);
+			}
+			this.#pushUiStatus();
+		});
 	}
 
 	/** Current lifecycle state. */
@@ -169,6 +201,9 @@ export class VoiceSession {
 	getStatus(): string {
 		if (this.#state === "error" && this.#error) {
 			return `error: ${this.#error}`;
+		}
+		if (this.#speaking) {
+			return "speaking…";
 		}
 		if (this.#state === "listening" && this.#capturePaused) {
 			return "pi working…";
@@ -214,7 +249,9 @@ export class VoiceSession {
 			model: this.#config.model,
 			voice: this.#config.voice,
 			sampleRate: this.#config.sampleRate,
+			tts: this.#config.tts,
 			capturePaused: this.#capturePaused,
+			speaking: this.#speaking,
 			hearing: this.#hearing,
 			partial: this.#partial || undefined,
 			audioChunks: this.#audioChunks,
@@ -277,10 +314,40 @@ export class VoiceSession {
 	setAgentBusy(busy: boolean): void {
 		this.#agentBusy = busy;
 		if (busy) {
+			// Agent work wins over TTS — stop speak-back so tools aren't talked over.
+			this.#playback.stop();
 			this.setCapturePaused(true);
-		} else if (this.#state === "listening") {
+		} else if (this.#state === "listening" && !this.#speaking) {
 			this.setCapturePaused(false);
 		}
+	}
+
+	/** Whether TTS speak-back is currently playing. */
+	isSpeaking(): boolean {
+		return this.#speaking;
+	}
+
+	/**
+	 * Optional speak-back of a short summary (VS6).
+	 * No-op when TTS is `off`, text is empty, or the session is not live.
+	 * Pauses capture while speaking to reduce echo.
+	 */
+	async speakBack(text: string): Promise<void> {
+		if (this.#config.tts === "off") return;
+		if (!this.isLive()) return;
+		const trimmed = text?.trim() ?? "";
+		if (!trimmed) return;
+		try {
+			await this.#playback.speak(trimmed);
+		} catch (err) {
+			// Don't fail the agent turn — surface and continue listening.
+			this.#notify(`voice tts: ${errorMessage(err)}`, "warning");
+		}
+	}
+
+	/** Stop in-flight TTS without tearing down the session. */
+	stopPlayback(): void {
+		this.#playback.stop();
 	}
 
 	/** Retain a UI handle for footer updates outside command handlers. */
@@ -432,12 +499,14 @@ export class VoiceSession {
 	 */
 	async stop(): Promise<void> {
 		if (this.#state === "idle" && !this.#client && !this.#capture) {
+			this.#playback.stop();
 			this.#notify("voice already stopped", "info");
 			this.#pushUiStatus(true);
 			return;
 		}
 
 		const gen = ++this.#generation;
+		this.#playback.stop();
 		this.#setState("stopping");
 		this.#pushUiStatus();
 
@@ -525,6 +594,8 @@ export class VoiceSession {
 			const event = args[0] as TranscriptEvent | undefined;
 			if (!event) return;
 			if (event.type === "speech_started") {
+				// Barge-in lite: stop speak-back when the user starts a new utterance.
+				this.#playback.stop();
 				this.#hearing = true;
 				this.#partial = "";
 				this.#notify("voice: hearing you…", "info");
@@ -662,6 +733,7 @@ export class VoiceSession {
 	async #handleUnexpectedClose(message: string, gen: number): Promise<void> {
 		if (gen !== this.#generation) return;
 		this.#generation++;
+		this.#playback.stop();
 		const client = this.#client;
 		const capture = this.#capture;
 		this.#client = undefined;

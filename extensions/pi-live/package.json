@@ -7,7 +7,7 @@
   "main": "./src/index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --import ./src/voice/ts-test-register.mjs --test src/voice/auth.test.ts src/voice/bridge.test.ts src/voice/realtime-client.test.ts src/voice/session.test.ts",
+    "test": "node --experimental-strip-types --import ./src/voice/ts-test-register.mjs --test src/voice/auth.test.ts src/voice/bridge.test.ts src/voice/realtime-client.test.ts src/voice/session.test.ts src/voice/playback.test.ts",
     "pi": "pi -e ./src/index.ts"
   },
   "pi": {
