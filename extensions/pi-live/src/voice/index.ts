@@ -11,6 +11,8 @@ export {
 	type VoiceConfig,
 } from "./config.js";
 
+export { MicCapture, type MicCaptureOptions } from "./capture.js";
+
 export {
 	deliverVoiceText,
 	type DeliverVoiceTextCallOptions,
