@@ -174,6 +174,11 @@ export class VoiceSession {
 				return "● listening · waiting for mic…";
 			}
 			if (!this.#hadAudible) {
+				// Chunks flowing but near-zero PCM — almost always OS mic permission
+				// or the wrong/muted default input device (not a "not listening" bug).
+				if (this.#audioChunks >= 30) {
+					return "● listening · mic silent (check macOS Mic privacy / input device)";
+				}
 				return `● listening · mic silent? (lvl ${levelPct(this.#audioLevel)})`;
 			}
 			return `● listening · lvl ${levelPct(this.#audioLevel)}`;

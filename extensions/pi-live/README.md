@@ -158,6 +158,7 @@ pi install .          # or: pi -e ./src/index.ts
 | WS 401 / 403 | OAuth expired — re-login via Codex; or switch to a valid API key. |
 | WS closes immediately | Model id / account entitlements; try `PI_VOICE_MODEL=gpt-realtime-mini` if available on your account. |
 | No transcript / silence | OS mic permission for the terminal app; correct default input device; watch `/voice status` stays `listening`. |
+| `micChunks` rising but `lvl=0%` / `mic silent` | **Capture works; the device is silent.** On macOS: System Settings → Privacy & Security → **Microphone** → enable the app hosting pi (Terminal, iTerm, Cursor, VS Code, Orca, …). Confirm default input is the real mic (not iPhone Continuity / empty aggregate). CLI check while speaking: `rec -n stat trim 0 1` — `Maximum amplitude` should be ≫ 0. |
 | Transcript but pi does nothing | Bridge needs the extension’s `sendUserMessage`; ensure you started voice from inside pi (not a bare unit test). |
 | Capture never resumes | Agent should fire `agent_settled`; `/voice stop` then `/voice start` recovers. |
 
