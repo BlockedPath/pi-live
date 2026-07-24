@@ -193,10 +193,15 @@ describe("buildDefaultSessionConfig", () => {
 			model: "gpt-realtime-2.1",
 			mode: "conversational",
 		});
-		assert.deepEqual(session.output_modalities, ["audio"]);
+		assert.deepEqual(session.output_modalities, ["audio", "text"]);
 		assert.equal(session.instructions, CONVERSATIONAL_INSTRUCTIONS);
 		assert.deepEqual(session.tools, [PI_TURN_TOOL]);
 		assert.equal(session.tool_choice, "auto");
+		assert.equal(
+			(session.audio?.input?.turn_detection as { create_response?: boolean })
+				?.create_response,
+			true,
+		);
 	});
 
 	it("clears tools in transcription mode", () => {
@@ -457,6 +462,57 @@ describe("RealtimeClient", () => {
 		assert.equal(calls[0]!.name, "pi_turn");
 		assert.equal(calls[0]!.callId, "call_1");
 		assert.equal(calls[0]!.arguments, '{"message":"list files"}');
+		client.close();
+	});
+
+	it("emits function_call from response.done output (deduped)", async () => {
+		const { client, sockets } = createHarness();
+		const ws = await connectReady(client, sockets);
+		const calls: FunctionCallEvent[] = [];
+		client.on("function_call", (ev) => calls.push(ev));
+
+		// arguments.done first
+		ws.receive({
+			type: "response.function_call_arguments.done",
+			name: "pi_turn",
+			call_id: "call_dup",
+			arguments: '{"message":"once"}',
+		});
+		// response.done with same call_id must not double-emit
+		ws.receive({
+			type: "response.done",
+			response: {
+				id: "resp_1",
+				status: "completed",
+				output: [
+					{
+						type: "function_call",
+						id: "item_1",
+						name: "pi_turn",
+						call_id: "call_dup",
+						arguments: '{"message":"once"}',
+					},
+				],
+			},
+		});
+		assert.equal(calls.length, 1);
+
+		// Fresh call only via response.done
+		ws.receive({
+			type: "response.done",
+			response: {
+				output: [
+					{
+						type: "function_call",
+						name: "pi_turn",
+						call_id: "call_only_done",
+						arguments: '{"message":"via done"}',
+					},
+				],
+			},
+		});
+		assert.equal(calls.length, 2);
+		assert.equal(calls[1]!.callId, "call_only_done");
 		client.close();
 	});
 

@@ -159,6 +159,15 @@ export interface RealtimeAudioDoneEvent {
 }
 
 /** Minimal server event shape we parse. */
+export interface RealtimeFunctionCallItem {
+	type?: string;
+	id?: string;
+	name?: string;
+	call_id?: string;
+	arguments?: string;
+	status?: string;
+}
+
 export interface RealtimeServerEvent {
 	type: string;
 	event_id?: string;
@@ -170,6 +179,13 @@ export interface RealtimeServerEvent {
 	arguments?: string;
 	delta?: string;
 	transcript?: string;
+	item?: RealtimeFunctionCallItem;
+	response?: {
+		id?: string;
+		status?: string;
+		output?: RealtimeFunctionCallItem[];
+		[key: string]: unknown;
+	};
 	error?: {
 		type?: string;
 		code?: string;
@@ -262,11 +278,37 @@ export function buildDefaultSessionConfig(
 		// Explicit empty tools so a live mode-switch clears conversational tools.
 		base.tools = [];
 		base.tool_choice = "none";
+		// Transcription plane: VAD for endpointing only; no assistant speech.
+		base.audio = {
+			...base.audio,
+			input: {
+				...base.audio?.input,
+				turn_detection: {
+					type: "server_vad",
+					create_response: false,
+					interrupt_response: false,
+				},
+			},
+		};
 	} else {
-		base.output_modalities = ["audio"];
+		// Full duplex voice: Realtime speaks + may call pi_turn.
+		// Include text so clients can show assistant transcripts alongside audio.
+		base.output_modalities = ["audio", "text"];
 		base.instructions = CONVERSATIONAL_INSTRUCTIONS;
 		base.tools = [PI_TURN_TOOL];
 		base.tool_choice = "auto";
+		base.audio = {
+			...base.audio,
+			input: {
+				...base.audio?.input,
+				turn_detection: {
+					type: "server_vad",
+					// Automatically answer after user speech + allow barge-in cancel.
+					create_response: true,
+					interrupt_response: true,
+				},
+			},
+		};
 	}
 
 	if (config.session) {
@@ -353,6 +395,8 @@ export class RealtimeClient implements RealtimeClientLike {
 	#sessionConfig: RealtimeSessionConfig | undefined;
 	#closed = false;
 	#connectPromise: Promise<void> | undefined;
+	/** Dedupe function_call emits across arguments.done / output_item.done / response.done. */
+	#seenCallIds = new Set<string>();
 
 	constructor(options: RealtimeClientOptions = {}) {
 		this.#wsFactory = options.webSocketFactory ?? defaultWebSocketFactory;
@@ -483,6 +527,7 @@ export class RealtimeClient implements RealtimeClientLike {
 		const ws = this.#ws;
 		this.#ws = undefined;
 		this.#connectPromise = undefined;
+		this.#seenCallIds.clear();
 		if (!ws) return;
 		try {
 			// 1000 = normal closure
@@ -635,6 +680,31 @@ export class RealtimeClient implements RealtimeClientLike {
 		this.#send({ type: "session.update", session: body });
 	}
 
+	#emitFunctionCall(partial: {
+		name: string;
+		callId: string;
+		arguments: string;
+		itemId?: string;
+	}): void {
+		const callId = partial.callId.trim();
+		if (!callId) return;
+		if (this.#seenCallIds.has(callId)) return;
+		this.#seenCallIds.add(callId);
+		// Bound memory for long sessions.
+		if (this.#seenCallIds.size > 200) {
+			const first = this.#seenCallIds.values().next().value;
+			if (typeof first === "string") this.#seenCallIds.delete(first);
+		}
+		const fc: FunctionCallEvent = {
+			name: partial.name,
+			callId,
+			arguments: partial.arguments || "{}",
+			itemId: partial.itemId,
+			timestamp: Date.now(),
+		};
+		this.#emit("function_call", fc);
+	}
+
 	#handleMessage(
 		data: WebSocket.RawData,
 		hooks: { onSessionCreated: () => void },
@@ -733,23 +803,52 @@ export class RealtimeClient implements RealtimeClientLike {
 				break;
 			}
 			case "response.function_call_arguments.done": {
-				const name = typeof event.name === "string" ? event.name : "";
-				const callId =
-					typeof event.call_id === "string" ? event.call_id : "";
-				const args =
-					typeof event.arguments === "string" ? event.arguments : "{}";
-				if (!callId) break;
-				const fc: FunctionCallEvent = {
-					name,
-					callId,
-					arguments: args,
+				this.#emitFunctionCall({
+					name: typeof event.name === "string" ? event.name : "",
+					callId: typeof event.call_id === "string" ? event.call_id : "",
+					arguments:
+						typeof event.arguments === "string" ? event.arguments : "{}",
 					itemId:
-						typeof event.item_id === "string"
-							? event.item_id
-							: undefined,
-					timestamp: Date.now(),
-				};
-				this.#emit("function_call", fc);
+						typeof event.item_id === "string" ? event.item_id : undefined,
+				});
+				break;
+			}
+			case "response.output_item.done": {
+				const item = event.item;
+				if (item && item.type === "function_call") {
+					this.#emitFunctionCall({
+						name: typeof item.name === "string" ? item.name : "",
+						callId: typeof item.call_id === "string" ? item.call_id : "",
+						arguments:
+							typeof item.arguments === "string" ? item.arguments : "{}",
+						itemId:
+							typeof item.id === "string"
+								? item.id
+								: typeof event.item_id === "string"
+									? event.item_id
+									: undefined,
+					});
+				}
+				break;
+			}
+			case "response.done": {
+				// Primary documented path for completed tool calls.
+				const output = event.response?.output;
+				if (Array.isArray(output)) {
+					for (const item of output) {
+						if (!item || item.type !== "function_call") continue;
+						this.#emitFunctionCall({
+							name: typeof item.name === "string" ? item.name : "",
+							callId:
+								typeof item.call_id === "string" ? item.call_id : "",
+							arguments:
+								typeof item.arguments === "string"
+									? item.arguments
+									: "{}",
+							itemId: typeof item.id === "string" ? item.id : undefined,
+						});
+					}
+				}
 				break;
 			}
 			// GA name; keep beta alias for older gateways.

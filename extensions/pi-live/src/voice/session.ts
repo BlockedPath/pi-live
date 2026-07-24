@@ -668,8 +668,12 @@ export class VoiceSession {
 			const deviceNote = this.#config.inputDevice
 				? ` · in=${this.#config.inputDevice}`
 				: "";
+			const modeHint =
+				this.#config.mode === "conversational"
+					? "realtime audio + pi_turn"
+					: "transcription";
 			this.#notify(
-				`voice listening (${auth.mode} · ${this.#config.mode}${deviceNote}) — speak anytime; ctrl+shift+v toggles`,
+				`voice listening (${auth.mode} · ${this.#config.mode}/${modeHint}${deviceNote}) — speak anytime; ctrl+shift+v toggles`,
 				"info",
 			);
 			this.#pushUiStatus();

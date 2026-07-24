@@ -682,7 +682,7 @@ describe("VoiceSession", () => {
 			output_modalities?: string[];
 			tools?: Array<{ name?: string }>;
 		};
-		assert.deepEqual(last.output_modalities, ["audio"]);
+		assert.deepEqual(last.output_modalities, ["audio", "text"]);
 		assert.equal(last.tools?.[0]?.name, "pi_turn");
 
 		session.setMode("transcription");
