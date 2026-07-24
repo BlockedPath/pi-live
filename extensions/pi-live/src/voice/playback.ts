@@ -469,40 +469,17 @@ export class VoicePlayback {
 
 
 /**
- * Play PCM16 mono realtime audio out (VS8 conversational).
+ * Stream PCM16 mono realtime audio out (VS8 conversational).
  *
- * Strategy:
- *  1. Buffer base64 PCM deltas for the current assistant item
- *  2. On `done()`, write a WAV and play via `afplay` (macOS) or `ffplay`
- *  3. Fall back to sox `play` raw stdin if file players unavailable
- *
- * Barge-in calls `stop()` which kills any player and reports audio_end_ms
- * for conversation.item.truncate.
+ * Streams chunks to sox `play` as they arrive so barge-in can kill playback
+ * mid-utterance. `stop()` immediately SIGTERMs the player and reports
+ * audio_end_ms for conversation.item.truncate.
  */
 export interface PcmStreamPlayerOptions {
 	sampleRate?: number;
 	spawn?: SpawnFn;
-	/** Override player binary for streaming fallback (default: `play`). */
+	/** Streaming player binary (default: `play` from sox). */
 	command?: string;
-}
-
-function writeWavPcm16Mono(pcm: Buffer, sampleRate: number): Buffer {
-	const dataSize = pcm.byteLength;
-	const header = Buffer.alloc(44);
-	header.write("RIFF", 0);
-	header.writeUInt32LE(36 + dataSize, 4);
-	header.write("WAVE", 8);
-	header.write("fmt ", 12);
-	header.writeUInt32LE(16, 16); // PCM chunk size
-	header.writeUInt16LE(1, 20); // audio format PCM
-	header.writeUInt16LE(1, 22); // mono
-	header.writeUInt32LE(sampleRate, 24);
-	header.writeUInt32LE(sampleRate * 2, 28); // byte rate
-	header.writeUInt16LE(2, 32); // block align
-	header.writeUInt16LE(16, 34); // bits per sample
-	header.write("data", 36);
-	header.writeUInt32LE(dataSize, 40);
-	return Buffer.concat([header, pcm]);
 }
 
 export class PcmStreamPlayer {
@@ -512,12 +489,13 @@ export class PcmStreamPlayer {
 	readonly #handlers = new Set<SpeakingHandler>();
 
 	#child: ChildProcess | undefined;
-	#chunks: Buffer[] = [];
+	#stdinFailed = false;
 	#bytesWritten = 0;
 	#itemId: string | undefined;
 	#speaking = false;
 	#generation = 0;
-	#playingFile: string | undefined;
+	/** True once any audio has been accepted for the current assistant turn. */
+	#hasAudio = false;
 
 	constructor(options: PcmStreamPlayerOptions = {}) {
 		this.#sampleRate = options.sampleRate ?? 24_000;
@@ -527,6 +505,11 @@ export class PcmStreamPlayer {
 
 	isSpeaking(): boolean {
 		return this.#speaking;
+	}
+
+	/** True if this turn received any assistant audio (playing or buffered). */
+	hasAudio(): boolean {
+		return this.#hasAudio || this.#speaking || Boolean(this.#itemId);
 	}
 
 	/** Milliseconds of PCM accepted so far for the current item. */
@@ -546,7 +529,9 @@ export class PcmStreamPlayer {
 		};
 	}
 
-	/** Append a base64 PCM16 chunk. */
+	/**
+	 * Append a base64 PCM16 chunk and stream it to the player immediately.
+	 */
 	appendBase64(delta: string, itemId?: string): void {
 		if (!delta) return;
 		let buf: Buffer;
@@ -557,116 +542,84 @@ export class PcmStreamPlayer {
 		}
 		if (buf.byteLength === 0) return;
 
-		if (itemId && itemId !== this.#itemId) {
+		if (itemId && this.#itemId && itemId !== this.#itemId) {
+			// New assistant item — restart the stream.
 			this.stop();
-			this.#itemId = itemId;
-		} else if (itemId) {
-			this.#itemId = itemId;
 		}
+		if (itemId) this.#itemId = itemId;
 
-		this.#chunks.push(buf);
+		this.#hasAudio = true;
 		this.#bytesWritten += buf.byteLength;
+		this.#ensureChild();
 		this.#setSpeaking(true);
-	}
 
-	/** Finalize the current audio segment and start playback. */
-	done(): void {
-		const gen = this.#generation;
-		const pcm = Buffer.concat(this.#chunks);
-		this.#chunks = [];
-		if (pcm.byteLength === 0) {
-			this.#setSpeaking(false);
+		const child = this.#child;
+		if (!child?.stdin || this.#stdinFailed || child.stdin.destroyed) {
 			return;
 		}
-		void this.#playBuffer(pcm, gen);
+		try {
+			child.stdin.write(buf);
+		} catch {
+			this.#stdinFailed = true;
+		}
 	}
 
 	/**
-	 * Stop playback immediately.
-	 * @returns item id + audio_end_ms suitable for conversation.item.truncate
+	 * End-of-audio marker from the server. Keeps the player draining; does not
+	 * block barge-in (stop() still kills immediately).
+	 */
+	done(): void {
+		const child = this.#child;
+		if (child?.stdin && !child.stdin.destroyed) {
+			try {
+				child.stdin.end();
+			} catch {
+				// ignore
+			}
+		}
+	}
+
+	/**
+	 * Stop playback immediately (barge-in).
+	 * @returns item id + audio_end_ms for conversation.item.truncate
 	 */
 	stop(): { itemId?: string; audioEndMs: number } {
 		const itemId = this.#itemId;
 		const audioEndMs = this.getPlayedMs();
 		this.#generation++;
 		const child = this.#child;
-		const file = this.#playingFile;
 		this.#child = undefined;
-		this.#playingFile = undefined;
-		this.#chunks = [];
+		this.#stdinFailed = false;
 		this.#bytesWritten = 0;
 		this.#itemId = undefined;
+		this.#hasAudio = false;
 		if (child) {
 			try {
-				child.kill("SIGTERM");
+				// Kill process group if possible so play/sox children die too.
+				if (typeof child.pid === "number" && child.pid > 0) {
+					try {
+						process.kill(-child.pid, "SIGKILL");
+					} catch {
+						child.kill("SIGKILL");
+					}
+				} else {
+					child.kill("SIGKILL");
+				}
 			} catch {
-				// ignore
+				try {
+					child.kill("SIGTERM");
+				} catch {
+					// ignore
+				}
 			}
-		}
-		if (file) {
-			void unlink(file).catch(() => undefined);
 		}
 		this.#setSpeaking(false);
 		return { itemId, audioEndMs };
 	}
 
-	async #playBuffer(pcm: Buffer, gen: number): Promise<void> {
-		if (gen !== this.#generation) return;
-
-		// Prefer WAV + afplay/ffplay (reliable on macOS).
-		const wav = writeWavPcm16Mono(pcm, this.#sampleRate);
-		const file = join(
-			tmpdir(),
-			`pi-voice-rt-${randomBytes(8).toString("hex")}.wav`,
-		);
-		try {
-			await writeFile(file, wav);
-		} catch {
-			// Fall through to sox raw stream.
-			this.#streamRaw(pcm, gen);
-			return;
-		}
-		if (gen !== this.#generation) {
-			await unlink(file).catch(() => undefined);
-			return;
-		}
-
-		const player = platform() === "darwin" ? "afplay" : "ffplay";
-		const args =
-			player === "afplay"
-				? [file]
-				: ["-nodisp", "-autoexit", "-loglevel", "quiet", file];
-
-		try {
-			const child = this.#spawn(player, args, {
-				stdio: "ignore",
-				env: process.env,
-			});
-			this.#child = child;
-			this.#playingFile = file;
-			this.#setSpeaking(true);
-			await new Promise<void>((resolve) => {
-				const finish = () => resolve();
-				child.on("error", finish);
-				child.on("close", finish);
-			});
-		} catch {
-			// Player missing — try sox play raw.
-			await unlink(file).catch(() => undefined);
-			if (gen === this.#generation) this.#streamRaw(pcm, gen);
-			return;
-		} finally {
-			if (gen === this.#generation) {
-				this.#child = undefined;
-				this.#playingFile = undefined;
-				this.#setSpeaking(false);
-			}
-			await unlink(file).catch(() => undefined);
-		}
-	}
-
-	#streamRaw(pcm: Buffer, gen: number): void {
-		if (gen !== this.#generation) return;
+	#ensureChild(): void {
+		if (this.#child && !this.#child.killed) return;
+		const gen = this.#generation;
 		try {
 			const child = this.#spawn(
 				this.#command,
@@ -682,18 +635,23 @@ export class PcmStreamPlayer {
 					"16",
 					"-c",
 					"1",
+					"--buffer",
+					"256",
 					"-",
 				],
 				{
 					stdio: ["pipe", "ignore", "ignore"],
 					env: process.env,
+					// Detached so we can kill the whole group on barge-in.
+					detached: true,
 				},
 			);
 			this.#child = child;
-			this.#setSpeaking(true);
+			this.#stdinFailed = false;
 			child.on("error", () => {
 				if (gen !== this.#generation) return;
 				this.#child = undefined;
+				this.#stdinFailed = true;
 				this.#setSpeaking(false);
 			});
 			child.on("close", () => {
@@ -701,14 +659,9 @@ export class PcmStreamPlayer {
 				if (this.#child === child) this.#child = undefined;
 				this.#setSpeaking(false);
 			});
-			try {
-				child.stdin?.write(pcm);
-				child.stdin?.end();
-			} catch {
-				this.#setSpeaking(false);
-			}
 		} catch {
-			this.#setSpeaking(false);
+			this.#child = undefined;
+			this.#stdinFailed = true;
 		}
 	}
 

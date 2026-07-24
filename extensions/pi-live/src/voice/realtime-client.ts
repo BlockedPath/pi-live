@@ -126,6 +126,13 @@ export type RealtimeClientEventMap = {
 	"audio.delta": [event: RealtimeAudioDeltaEvent];
 	/** Conversational: end of an assistant audio segment. */
 	"audio.done": [event: RealtimeAudioDoneEvent];
+	/** Conversational: assistant speech transcript (side-channel with audio out). */
+	"assistant_transcript.delta": [event: TranscriptEvent];
+	"assistant_transcript.done": [event: TranscriptEvent];
+	/** A model response started (VAD or manual response.create). */
+	"response.created": [info: { responseId?: string }];
+	/** A model response finished (completed / cancelled). */
+	"response.done": [info: { responseId?: string; status?: string }];
 	error: [error: RealtimeClientError];
 	close: [info: { code: number; reason: string }];
 	/** Raw parsed server event for extensibility (tools, audio deltas, …). */
@@ -381,6 +388,9 @@ function isBenignRealtimeError(message: string, code?: string): boolean {
 	if (m.includes("no active response")) return true;
 	if (m.includes("cancellation failed") && m.includes("no active")) return true;
 	if (code === "response_cancel_not_active") return true;
+	// Manual response.create fallback may race VAD auto-create.
+	if (m.includes("already has an active response")) return true;
+	if (m.includes("conversation already has")) return true;
 	return false;
 }
 
@@ -858,6 +868,28 @@ export class RealtimeClient implements RealtimeClientLike {
 						});
 					}
 				}
+				this.#emit("response.done", {
+					responseId:
+						typeof event.response?.id === "string"
+							? event.response.id
+							: typeof event.response_id === "string"
+								? event.response_id
+								: undefined,
+					status:
+						typeof event.response?.status === "string"
+							? event.response.status
+							: undefined,
+				});
+				break;
+			}
+			case "response.cancelled": {
+				this.#emit("response.done", {
+					responseId:
+						typeof event.response_id === "string"
+							? event.response_id
+							: undefined,
+					status: "cancelled",
+				});
 				break;
 			}
 			// GA name; keep beta alias for older gateways.
@@ -892,6 +924,47 @@ export class RealtimeClient implements RealtimeClientLike {
 							: undefined,
 					timestamp: Date.now(),
 				} satisfies RealtimeAudioDoneEvent);
+				break;
+			}
+			case "response.output_audio_transcript.delta":
+			case "response.audio_transcript.delta": {
+				const piece = typeof event.delta === "string" ? event.delta : "";
+				if (!piece) break;
+				this.#emit("assistant_transcript.delta", {
+					type: "partial",
+					text: piece,
+					itemId:
+						typeof event.item_id === "string" ? event.item_id : undefined,
+					timestamp: Date.now(),
+				} satisfies TranscriptEvent);
+				break;
+			}
+			case "response.output_audio_transcript.done":
+			case "response.audio_transcript.done": {
+				const text =
+					typeof event.transcript === "string"
+						? event.transcript
+						: typeof event.delta === "string"
+							? event.delta
+							: "";
+				this.#emit("assistant_transcript.done", {
+					type: "final",
+					text,
+					itemId:
+						typeof event.item_id === "string" ? event.item_id : undefined,
+					timestamp: Date.now(),
+				} satisfies TranscriptEvent);
+				break;
+			}
+			case "response.created": {
+				const responseId =
+					typeof event.response_id === "string"
+						? event.response_id
+						: typeof (event.response as { id?: unknown } | undefined)?.id ===
+							  "string"
+							? (event.response as { id: string }).id
+							: undefined;
+				this.#emit("response.created", { responseId });
 				break;
 			}
 			case "error": {

@@ -229,6 +229,10 @@ export class VoiceSession {
 	}> = [];
 	/** In-flight pi_turn call ids (dedupe / status). */
 	#activePiTurns = 0;
+	/** Realtime model response currently in flight (audio / tools). */
+	#responseActive = false;
+	/** Latest assistant item id for truncate on barge-in. */
+	#assistantItemId: string | undefined;
 
 	readonly #stateHandlers = new Set<StateChangeHandler>();
 	readonly #transcriptHandlers = new Set<TranscriptHandler>();
@@ -302,8 +306,13 @@ export class VoiceSession {
 		if (this.#reconnecting) {
 			return `reconnecting (${this.#reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})…`;
 		}
-		if (this.#speaking) {
-			return "speaking…";
+		if (this.#speaking || this.#pcmOut.isSpeaking()) {
+			return this.#config.mode === "conversational"
+				? "speaking (realtime)…"
+				: "speaking…";
+		}
+		if (this.#responseActive && this.#config.mode === "conversational") {
+			return "assistant…";
 		}
 		if (this.#activePiTurns > 0) {
 			return "pi working…";
@@ -845,16 +854,16 @@ export class VoiceSession {
 			const event = args[0] as TranscriptEvent | undefined;
 			if (!event) return;
 			if (event.type === "speech_started") {
+				// Barge-in FIRST: kill speaker audio before anything else.
+				this.#bargeIn(client);
 				// Mark hearing before stop() so echo-guard resumes immediately.
 				this.#hearing = true;
 				this.#partial = "";
 				this.#clearEchoGuardTimer();
-				// Barge-in: stop local playback + truncate Realtime audio out.
-				this.#bargeIn(client);
 				if (!this.#agentBusy && this.#state === "listening") {
 					this.setCapturePaused(false);
 				}
-				this.#notify("voice: hearing you…", "info");
+				// Avoid spamming notify on every VAD blip while talking over assistant.
 			} else if (event.type === "speech_stopped") {
 				this.#hearing = false;
 				// Keep partial until final arrives.
@@ -910,12 +919,47 @@ export class VoiceSession {
 			if (this.#config.mode !== "conversational") return;
 			const event = args[0] as RealtimeAudioDeltaEvent | undefined;
 			if (!event?.delta) return;
+			this.#responseActive = true;
+			if (event.itemId) this.#assistantItemId = event.itemId;
+			// Stream immediately — do not wait for audio.done (needed for barge-in).
 			this.#pcmOut.appendBase64(event.delta, event.itemId);
 			this.#pushUiStatus();
+			this.#pushPartialWidget();
 		};
 		const onAudioDone = (...args: unknown[]) => {
 			if (gen !== this.#generation) return;
 			this.#pcmOut.done();
+		};
+		const onResponseCreated = (..._args: unknown[]) => {
+			if (gen !== this.#generation) return;
+			this.#responseActive = true;
+			this.#pushUiStatus();
+			this.#pushPartialWidget();
+		};
+		const onAssistantDelta = (...args: unknown[]) => {
+			if (gen !== this.#generation) return;
+			const event = args[0] as TranscriptEvent | undefined;
+			const piece = event?.text ?? "";
+			if (!piece) return;
+			// Reuse partial slot with a marker via widget path below.
+			this.#partial = `${this.#partial}${piece}`;
+			// Prefix-less accumulation under lastFinal for assistant flash is noisy;
+			// widget shows speaking state via #responseActive / pcmOut.
+			this.#pushPartialWidget();
+		};
+		const onAssistantDone = (...args: unknown[]) => {
+			if (gen !== this.#generation) return;
+			const event = args[0] as TranscriptEvent | undefined;
+			const text = event?.text?.trim() ?? this.#partial.trim();
+			this.#partial = "";
+			if (text) {
+				this.#lastFinal = text;
+				this.#lastFinalAt = Date.now();
+				this.#armFinalWidgetTimer(gen);
+			}
+			this.#responseActive = false;
+			this.#pushUiStatus();
+			this.#pushPartialWidget();
 		};
 
 		sub("transcript.done", onDone);
@@ -925,6 +969,16 @@ export class VoiceSession {
 		sub("function_call", onFunctionCall);
 		sub("audio.delta", onAudioDelta);
 		sub("audio.done", onAudioDone);
+		const onResponseDone = (..._args: unknown[]) => {
+			if (gen !== this.#generation) return;
+			this.#responseActive = false;
+			this.#pushUiStatus();
+			this.#pushPartialWidget();
+		};
+		sub("response.created", onResponseCreated);
+		sub("response.done", onResponseDone);
+		sub("assistant_transcript.delta", onAssistantDelta);
+		sub("assistant_transcript.done", onAssistantDone);
 		sub("error", onError);
 		sub("close", onClose);
 		this.#unsubs = unsubs;
@@ -1023,18 +1077,22 @@ export class VoiceSession {
 	 * we still send cancel + truncate for the WebSocket playback path.
 	 */
 	#bargeIn(client: RealtimeClientLike): void {
+		// Always cut local TTS / realtime PCM immediately.
 		this.#playback.stop();
-		const wasRealtimeAudio =
+		const hadAudio = this.#pcmOut.hasAudio() || this.#pcmOut.isSpeaking();
+		const itemId =
+			this.#pcmOut.getCurrentItemId() ?? this.#assistantItemId;
+		const shouldCancel =
 			this.#config.mode === "conversational" &&
-			(this.#pcmOut.isSpeaking() || Boolean(this.#pcmOut.getCurrentItemId()));
-		const { itemId, audioEndMs } = this.#pcmOut.stop();
-		// Only cancel/truncate when the assistant was actually producing audio.
-		// Bare response.cancel while idle → "Cancellation failed: no active response".
-		if (!wasRealtimeAudio) return;
+			(this.#responseActive || hadAudio || Boolean(itemId));
+		const { audioEndMs } = this.#pcmOut.stop();
+		this.#responseActive = false;
+		this.#assistantItemId = undefined;
+		if (!shouldCancel) return;
 		try {
 			client.cancelResponse?.();
 		} catch {
-			// ignore
+			// ignore — benign when already finished
 		}
 		if (itemId) {
 			try {
@@ -1043,6 +1101,8 @@ export class VoiceSession {
 				// ignore
 			}
 		}
+		this.#pushUiStatus();
+		this.#pushPartialWidget();
 	}
 
 	#rejectSettledWaiters(reason: string): void {
@@ -1114,6 +1174,8 @@ export class VoiceSession {
 		}
 
 		this.#activePiTurns += 1;
+		// Tool call ends the current model response turn until we return output.
+		this.#responseActive = false;
 		this.#pushUiStatus();
 		this.#notify(`voice pi_turn → pi: ${truncate(message, 60)}`, "info");
 
@@ -1410,6 +1472,8 @@ export class VoiceSession {
 		this.#partial = "";
 		this.#lastFinal = "";
 		this.#lastFinalAt = 0;
+		this.#responseActive = false;
+		this.#assistantItemId = undefined;
 		this.#audioChunks = 0;
 		this.#audioLevel = 0;
 		this.#lastLevelUiAt = 0;
@@ -1466,10 +1530,20 @@ export class VoiceSession {
 			}
 
 			const partial = this.#partial.trim();
-			if (partial) {
+			if (this.#hearing) {
+				lines.push(
+					partial
+						? `voice ▸ ${truncate(partial, 100)}`
+						: "voice ▸ …",
+				);
+			} else if (this.#pcmOut.isSpeaking() || this.#responseActive) {
+				lines.push(
+					partial
+						? `voice ◂ ${truncate(partial, 100)}`
+						: "voice ◂ speaking…",
+				);
+			} else if (partial) {
 				lines.push(`voice ▸ ${truncate(partial, 100)}`);
-			} else if (this.#hearing) {
-				lines.push("voice ▸ …");
 			} else if (
 				this.#lastFinal &&
 				Date.now() - this.#lastFinalAt < FINAL_WIDGET_MS
