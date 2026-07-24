@@ -102,7 +102,7 @@ On the default OpenAI backend, **the Realtime model never edits files or runs sh
 | **OpenAI** (default) | Leave `PI_VOICE_BACKEND` unset or set it to `openai` | Pi connects directly to the OpenAI Realtime WebSocket | Existing transcription and conversational `pi_turn` path; unchanged |
 | **Codex app-server realtime** (experimental) | `PI_VOICE_BACKEND=codex` | Pi spawns local `codex app-server --stdio` and adapts `thread/realtime/*` JSON-RPC events | V2 text for transcription; V3 audio for conversational; reuses the existing session UX |
 
-The Codex backend is strictly opt-in. Missing or invalid values fall back to `openai`. It requires Codex CLI 0.145+ and currently requires an **OpenAI API key**; ChatGPT/Codex OAuth alone is rejected by app-server realtime. Set `OPENAI_API_KEY` or `PI_VOICE_API_KEY` before starting pi. The extension negotiates `experimentalApi`, forwards the key only to the child environment, checks `codex --version`, uses V2 for text/transcription, and uses V3 for audio/conversational.
+The Codex backend is strictly opt-in. Missing or invalid values fall back to `openai`. It requires Codex CLI 0.145+. Codex app-server V3 bidirectional realtime works with ChatGPT/Codex OAuth (`~/.codex/auth.json`) — no API key is required for the audio/conversational path. (V2 text/transcription may still need an API key on some accounts; set `OPENAI_API_KEY` or `PI_VOICE_API_KEY` if a `requires API key auth` error appears.) The extension negotiates `experimentalApi`, forwards resolved credentials only to the child environment, checks `codex --version`, uses V2 for text/transcription, and uses V3 for audio/conversational.
 
 Codex realtime limitations:
 
@@ -118,7 +118,7 @@ These differences are confined to the thin `RealtimeClientLike` adapter; the def
 
 1. **Auth**
    - **Default OpenAI backend:** Codex / ChatGPT OAuth (`~/.codex/auth.json`) or an API key.
-   - **Codex app-server backend:** API key required by Codex 0.145 realtime. Set `OPENAI_API_KEY` or `PI_VOICE_API_KEY`; the session forces API-key auth for this backend.
+   - **Codex app-server backend:** ChatGPT/Codex OAuth is sufficient for V3 bidi realtime (`auto`). Optionally set `OPENAI_API_KEY` or `PI_VOICE_API_KEY` if a `requires API key auth` error appears for V2 text mode; the session follows `PI_VOICE_AUTH` and does NOT force a key.
 
 2. **Microphone capture (SoX)**  
    PCM16 mono @ 24 kHz via CLI `rec` / `sox` (no native Node addons):
@@ -179,7 +179,7 @@ Transcript widget (above the editor, when `setWidget` is available):
 | `PI_VOICE_AUTH` | `auto` | `auto` \| `codex` \| `api-key` |
 | `PI_VOICE_CODEX_HOME` | `~/.codex` | Where to read `auth.json` |
 | `PI_VOICE_SAMPLE_RATE` | `24000` | PCM rate |
-| `PI_VOICE_API_KEY` | *(unset)* | Explicit API key override (else `OPENAI_API_KEY`); required for the Codex app-server backend and `PI_VOICE_TTS=openai` |
+| `PI_VOICE_API_KEY` | *(unset)* | Explicit API key override (else `OPENAI_API_KEY`); needed for `PI_VOICE_TTS=openai` and as a fallback if V2 text realtime reports `requires API key auth` |
 | `PI_VOICE_INPUT_DEVICE` | *(system default)* | CoreAudio device name, e.g. `iPhone Microphone` or `MacBook Air Microphone` |
 | `PI_VOICE_RELAY_TARGET` | *(unset)* | Herdr agent name or pane id — finals go via `herdr agent prompt <target> …` |
 | `PI_VOICE_RELAY_MODE` | `local` (or `relay` if target set) | `local` \| `relay` \| `both` |
@@ -218,12 +218,14 @@ pi -e ./src/index.ts
 ```bash
 cd extensions/pi-live && npm install
 codex --version
-export PI_VOICE_API_KEY='sk-...' # or export OPENAI_API_KEY='sk-...'
+# ChatGPT/Codex OAuth (codex login) is enough for V3 audio. V2 text (transcription)
+# may need a key on some accounts — uncomment if you hit `requires API key auth`:
+# export PI_VOICE_API_KEY='sk-...'   # or export OPENAI_API_KEY='sk-...'
 export PI_VOICE_BACKEND=codex
 export PI_VOICE_MODE=transcription # uses realtime V2 text; coding stays in pi
 export PI_VOICE_TTS=off
 pi -e ./src/index.ts
-# /voice status  → includes backend=codex and authMode=api-key
+# /voice status  → includes backend=codex (authMode follows PI_VOICE_AUTH; auto → chatgpt)
 # /voice start   → speak a task → final transcript bridges into pi
 # /voice stop
 ```
@@ -264,12 +266,12 @@ Without `play`, barge-in truncate timing still works; you just won't hear audio 
 
 | Symptom | What to check |
 | --- | --- |
-| `No voice auth available` / `missing_auth` | Set `OPENAI_API_KEY` or `PI_VOICE_API_KEY`. The Codex app-server backend requires API-key auth; ChatGPT login alone is not sufficient in Codex 0.145. |
+| `No voice auth available` / `missing_auth` | Set `OPENAI_API_KEY` or `PI_VOICE_API_KEY`. For the Codex backend, ChatGPT/Codex OAuth is enough for V3 realtime; a key is only needed if V2 text mode reports `requires API key auth`. |
 | `codex backend requires the Codex CLI` | Install/update Codex, ensure `codex` is on the pi process `PATH`, and run `codex --version`. Or unset `PI_VOICE_BACKEND` to use the default OpenAI backend. |
 | `experimentalApi capability` | Update to the latest branch/PR version; the adapter must send `capabilities.experimentalApi=true` during initialize. |
 | `text realtime output modality requires realtime v2` | Update to the latest branch/PR version; transcription now selects V2 text automatically while conversational mode uses V3 audio. |
-| `realtime conversation requires API key auth` | Export `PI_VOICE_API_KEY` or `OPENAI_API_KEY` before launching pi. |
-| `codex realtime rejected start` | Check the full reported message, API-key validity, model/account entitlement, and Codex version. Use `PI_VOICE_BACKEND=openai` to return to the default backend. |
+| `realtime conversation requires API key auth` | V2 text mode on some accounts needs a key — export `PI_VOICE_API_KEY`/`OPENAI_API_KEY`, or use `PI_VOICE_MODE=conversational` (V3 audio) which works with ChatGPT OAuth. |
+| `codex realtime rejected start` | Check the full reported message, Codex version, and model/account entitlement. Use `PI_VOICE_BACKEND=openai` to return to the default backend. |
 | `sox/rec not found on PATH` | `brew install sox`; ensure Homebrew’s bin is on `PATH` inside the pi process. |
 | WS 401 / 403 | OAuth expired — re-login via Codex; or switch to a valid API key. |
 | WS closes immediately | Model id / account entitlements; try `PI_VOICE_MODEL=gpt-realtime-mini` if available on your account. |

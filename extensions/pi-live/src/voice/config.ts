@@ -16,7 +16,8 @@ export type VoiceRelayMode = "local" | "relay" | "both";
  * - `openai` (default) — pi talks to the OpenAI Realtime WebSocket API directly.
  * - `codex` — drive the local Codex CLI experimental app-server realtime and map
  *   its `thread/realtime/*` events into the existing `/voice` UX. Requires the
- *   `codex` binary and API-key auth; errors clearly when unavailable.
+ *   `codex` binary; V3 bidi realtime works with ChatGPT/Codex OAuth (no API key
+ *   needed). Errors clearly when the CLI is unavailable.
  */
 export type VoiceBackend = "openai" | "codex";
 

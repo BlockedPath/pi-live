@@ -614,11 +614,7 @@ export class VoiceSession {
 
 		try {
 			const auth = await this.#resolveAuth({
-				// Codex app-server realtime 0.145 rejects ChatGPT OAuth.
-				prefer:
-					this.#config.backend === "codex"
-						? "api-key"
-						: this.#config.auth,
+				prefer: this.#config.auth,
 				codexHome: this.#config.codexHome,
 				apiKey: this.#config.apiKey,
 			});
@@ -1414,10 +1410,7 @@ export class VoiceSession {
 			throw new Error("reconnect aborted");
 		}
 		const auth = await this.#resolveAuth({
-			prefer:
-				this.#config.backend === "codex"
-					? "api-key"
-					: this.#config.auth,
+			prefer: this.#config.auth,
 			codexHome: this.#config.codexHome,
 			apiKey: this.#config.apiKey,
 		});

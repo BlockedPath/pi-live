@@ -385,8 +385,9 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 			}
 		}
 
-		// 2. Open the transport. API-key credentials resolved by pi (including
-		// PI_VOICE_API_KEY) are forwarded only to the child environment.
+		// 2. Open the transport. With ChatGPT/Codex OAuth the app-server reads its
+		// own ~/.codex/auth.json; resolved API-key credentials (if any) are forwarded
+		// to the child environment as OPENAI_API_KEY for V2 text fallback.
 		const transport =
 			this.#injectedTransport ??
 			this.#spawnTransport(this.#appServerEnv(authHeaders));

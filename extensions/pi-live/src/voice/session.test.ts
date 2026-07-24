@@ -673,7 +673,7 @@ describe("VoiceSession", () => {
 		assert.equal(session.isCapturePaused(), false);
 	});
 
-	it("forces API-key auth for the Codex app-server backend", async () => {
+	it("Codex backend respects the configured auth preference (no force)", async () => {
 		let prefer: string | undefined;
 		const client = new FakeClient();
 		const capture = new FakeCapture();
@@ -687,7 +687,9 @@ describe("VoiceSession", () => {
 			createCapture: () => capture,
 		});
 		await session.start({ pi: { sendUserMessage: () => undefined } });
-		assert.equal(prefer, "api-key");
+		// Codex app-server V3 bidi realtime works with ChatGPT/Codex OAuth —
+		// the backend must NOT force api-key; it follows PI_VOICE_AUTH (auto by default).
+		assert.equal(prefer, "auto");
 		await session.stop();
 	});
 
