@@ -1,0 +1,38 @@
+name: Project triage
+
+on:
+  issues:
+    types: [opened, reopened, labeled, unlabeled]
+
+permissions:
+  issues: read
+
+jobs:
+  triage:
+    name: add + sync priority
+    runs-on: ubuntu-latest
+    # Requires a PAT (or GitHub App token) with project + repo scopes stored
+    # as the PROJECT_TOKEN secret. The default GITHUB_TOKEN cannot write to
+    # user-owned Projects v2. See CONTRIBUTING.md / repo Settings → Secrets.
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+
+      - name: Add issue to project and sync Priority
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          PROJECT_LOGIN: BlockedPath
+          PROJECT_NUMBER: "6"
+          ISSUE_NODE_ID: ${{ github.event.issue.node_id }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          LABELS: ${{ toJSON(github.event.issue.labels.*.name) }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "No PROJECT_TOKEN secret set; skipping."
+            exit 0
+          fi
+          node scripts/project-triage.mjs
