@@ -18,6 +18,8 @@ and GitHub Projects v2 automation. Repo: <https://github.com/BlockedPath/pi-live
 ├── CONTRIBUTING.md                     # dev workflow + code style
 ├── CODE_OF_CONDUCT.md
 ├── LICENSE                            # MIT
+├── docs/
+│   └── voice-realtime-plan.md          # realtime voice extension plan (active)
 ├── .github/
 │   ├── ISSUE_TEMPLATE/                # bug_report.md, feature_request.md, config.yml
 │   ├── PULL_REQUEST_TEMPLATE.md
@@ -36,6 +38,10 @@ and GitHub Projects v2 automation. Repo: <https://github.com/BlockedPath/pi-live
     └── project-triage.mjs            # GraphQL helper run by .github/workflows/project-triage.yml
 ```
 
+## Active plans
+
+- **Realtime voice** — [docs/voice-realtime-plan.md](docs/voice-realtime-plan.md); epic [#6](https://github.com/BlockedPath/pi-live/issues/6); vertical slices [#7](https://github.com/BlockedPath/pi-live/issues/7)–[#16](https://github.com/BlockedPath/pi-live/issues/16) (label `voice`).
+
 ## Development
 
 ```bash
@@ -50,6 +56,9 @@ the dir into `.pi/extensions/pi-live` and use `/reload`.
 
 Code style in the extension: `defineTool` + `ExtensionAPI` from
 `@earendil-works/pi-coding-agent`; `Type` from `@earendil-works/pi-ai`; tabs.
+
+When changing voice-related code under `extensions/pi-live/src/voice/`, follow
+[docs/voice-realtime-plan.md](docs/voice-realtime-plan.md) phases and exit criteria.
 
 ## CI & branch protection
 
