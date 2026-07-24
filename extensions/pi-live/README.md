@@ -6,6 +6,7 @@ skeleton demonstrating the common patterns:
 - a custom tool registered with `pi.registerTool()` (the `hello` tool)
 - a `session_start` hook with a UI notification
 - a custom `/hello` slash command
+- a `/voice` status stub (voice foundation — issue [#7](https://github.com/BlockedPath/pi-live/issues/7))
 
 ## Install
 
@@ -54,15 +55,49 @@ Once loaded:
 
 - Ask the agent: *"Use the hello tool to greet Sam."*
 - Or type the command: `/hello Sam`
+- Voice status stub: `/voice` or `/voice status` (reports `idle`; no mic/network yet)
+
+## Voice (foundation)
+
+VS0 skeleton for hands-free voice control (epic
+[#6](https://github.com/BlockedPath/pi-live/issues/6), plan issue
+[#7](https://github.com/BlockedPath/pi-live/issues/7)).
+
+Module layout under `src/voice/`
+
+| File | Role |
+| --- | --- |
+| `types.ts` | Shared contracts (auth, session, transcripts, bridge) |
+| `config.ts` | `PI_VOICE_*` env → typed config |
+| `session.ts` | Idle stub (`getStatus` / `getState`) |
+| `index.ts` | Public barrel |
+
+Config defaults (override via env):
+
+| Variable | Default |
+| --- | --- |
+| `PI_VOICE_MODE` | `transcription` |
+| `PI_VOICE_MODEL` | `gpt-realtime-2.1` |
+| `PI_VOICE_VOICE` | `marin` |
+| `PI_VOICE_AUTH` | `auto` |
+| `PI_VOICE_CODEX_HOME` | `~/.codex` |
+| `PI_VOICE_SAMPLE_RATE` | `24000` |
+
+Later slices (do not implement here): auth (#8), realtime client (#9), mic
+capture (#10), pi bridge (#11), session MVP (#12).
+
+Dependency `ws` is declared now so Wave 1 realtime work does not thrash
+`package.json`.
 
 ## Layout
 
 ```
 extensions/pi-live/
-├── package.json   # declares the pi extension entrypoint + dev deps
+├── package.json   # declares the pi extension entrypoint + deps
 ├── tsconfig.json   # strict TS config for typechecking
 └── src/
-    └── index.ts    # the extension
+    ├── index.ts    # extension entry (hello + /voice status)
+    └── voice/      # voice foundation (types, config, idle session stub)
 ```
 
 ## Next steps
@@ -73,6 +108,7 @@ Good things to add next:
 - a `tool_call` gate that blocks dangerous commands
 - a custom command (`pi.registerCommand`)
 - persisted state via `pi.appendEntry`
+- voice MVP slices #8–#12 (auth, realtime, capture, bridge, session)
 
 See the upstream
 [extension docs](https://github.com/earendil-works/pi-coding-agent/blob/main/docs/extensions.md)

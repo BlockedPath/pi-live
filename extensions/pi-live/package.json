@@ -12,9 +12,13 @@
   "pi": {
     "extensions": ["./src/index.ts"]
   },
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.82.0",
     "@earendil-works/pi-ai": "^0.82.0",
+    "@types/ws": "^8.18.1",
     "typescript": "^7.0.2"
   }
 }
