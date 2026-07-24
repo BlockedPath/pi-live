@@ -67,7 +67,11 @@ export interface VoiceSessionStatus {
 }
 
 /** Streaming / final transcript events from the Realtime client (#9 / #12). */
-export type TranscriptEventType = "partial" | "final" | "speech_started" | "speech_stopped";
+export type TranscriptEventType =
+	| "partial"
+	| "final"
+	| "speech_started"
+	| "speech_stopped";
 
 export interface TranscriptEvent {
 	type: TranscriptEventType;
@@ -94,7 +98,12 @@ export interface DeliverVoiceTextOptions {
  */
 export type DeliverVoiceText = (
 	// ExtensionAPI is structural here to avoid a hard runtime dep from types.
-	pi: { sendUserMessage: (text: string, opts?: { deliverAs?: BridgeDeliveryMode }) => void },
+	pi: {
+		sendUserMessage: (
+			text: string,
+			opts?: { deliverAs?: BridgeDeliveryMode },
+		) => void;
+	},
 	text: string,
 	opts?: DeliverVoiceTextOptions,
 ) => void;

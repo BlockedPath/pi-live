@@ -60,8 +60,9 @@ Once loaded:
 ## Voice (foundation)
 
 VS0 skeleton for hands-free voice control (epic
-[#6](https://github.com/BlockedPath/pi-live/issues/6), plan issue
-[#7](https://github.com/BlockedPath/pi-live/issues/7)).
+[#6](https://github.com/BlockedPath/pi-live/issues/6), slice
+[#7](https://github.com/BlockedPath/pi-live/issues/7)). Full plan:
+[`docs/voice-realtime-plan.md`](../../docs/voice-realtime-plan.md).
 
 Module layout under `src/voice/`
 

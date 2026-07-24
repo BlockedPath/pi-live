@@ -66,9 +66,7 @@ export function loadVoiceConfig(
 	const codexHomeRaw = env.PI_VOICE_CODEX_HOME?.trim() || "~/.codex";
 
 	const apiKey =
-		env.PI_VOICE_API_KEY?.trim() ||
-		env.OPENAI_API_KEY?.trim() ||
-		undefined;
+		env.PI_VOICE_API_KEY?.trim() || env.OPENAI_API_KEY?.trim() || undefined;
 
 	return {
 		mode: parseMode(env.PI_VOICE_MODE?.trim()),
