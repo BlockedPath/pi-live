@@ -120,11 +120,9 @@ export class VoiceSession {
 					codexHome: options.codexHome,
 					apiKey: options.apiKey,
 				}));
-		this.#createClient =
-			deps.createClient ?? (() => new RealtimeClient());
+		this.#createClient = deps.createClient ?? (() => new RealtimeClient());
 		this.#createCapture =
-			deps.createCapture ??
-			((sampleRate) => new MicCapture({ sampleRate }));
+			deps.createCapture ?? ((sampleRate) => new MicCapture({ sampleRate }));
 		this.#deliverText = deps.deliverText ?? deliverVoiceText;
 	}
 
@@ -281,10 +279,7 @@ export class VoiceSession {
 			this.#client = client;
 			this.#wireClient(client, gen);
 
-			await client.connect(
-				auth.headers,
-				connectConfigFromVoice(this.#config),
-			);
+			await client.connect(auth.headers, connectConfigFromVoice(this.#config));
 			if (gen !== this.#generation) {
 				this.#clearClientSubs();
 				this.#client = undefined;
@@ -501,10 +496,7 @@ export class VoiceSession {
 			});
 			this.#notify(`voice → pi: ${truncate(text, 60)}`, "info");
 		} catch (err) {
-			this.#notify(
-				`voice bridge failed: ${errorMessage(err)}`,
-				"error",
-			);
+			this.#notify(`voice bridge failed: ${errorMessage(err)}`, "error");
 		}
 	}
 

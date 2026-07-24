@@ -37,10 +37,7 @@ class FakeClient implements RealtimeClientLike {
 	closed = false;
 	readonly #listeners = new Map<string, Set<(...args: unknown[]) => void>>();
 
-	connect(
-		authHeaders: Record<string, string>,
-		config: unknown,
-	): Promise<void> {
+	connect(authHeaders: Record<string, string>, config: unknown): Promise<void> {
 		this.headers = authHeaders;
 		this.config = config;
 		this.connected = true;

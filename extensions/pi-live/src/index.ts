@@ -123,8 +123,7 @@ export default function (pi: ExtensionAPI) {
 
 	// VS5: full transcription MVP control surface.
 	pi.registerCommand("voice", {
-		description:
-			"Voice transcription: /voice [start|stop|status|toggle] (MVP)",
+		description: "Voice transcription: /voice [start|stop|status|toggle] (MVP)",
 		handler: async (args, ctx) => {
 			const { sub } = parseVoiceArgs(args);
 			const sessionRef = getSharedVoiceSession();
