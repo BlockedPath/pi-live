@@ -1,18 +1,32 @@
 # pi-live extension
 
-A small [pi](https://github.com/earendil-works/pi-coding-agent) extension
-skeleton demonstrating the common patterns:
+A [pi](https://github.com/earendil-works/pi-coding-agent) extension with a small
+demo surface plus a **voice transcription MVP** (epic
+[#6](https://github.com/BlockedPath/pi-live/issues/6), slice
+[#12](https://github.com/BlockedPath/pi-live/issues/12)).
 
-- a custom tool registered with `pi.registerTool()` (the `hello` tool)
-- a `session_start` hook with a UI notification
-- a custom `/hello` slash command
-- a `/voice` status stub (voice foundation — issue [#7](https://github.com/BlockedPath/pi-live/issues/7))
+- custom tool: `hello`
+- `session_start` hook with a UI notification
+- `/hello` slash command
+- `/voice start|stop|status` transcription loop (mic → OpenAI Realtime → pi)
+
+Full plan: [`docs/voice-realtime-plan.md`](../../docs/voice-realtime-plan.md).
 
 ## Install
 
 Pick one:
 
 ### As a pi package
+
+From this directory:
+
+```bash
+pi install .
+# or project-local settings:
+pi install . -l
+```
+
+From the repo root:
 
 ```bash
 pi install ./extensions/pi-live
@@ -43,11 +57,12 @@ pi -e ./src/index.ts
 cd extensions/pi-live
 npm install        # first time only
 npm run typecheck  # tsc --noEmit
+npm test           # unit tests (no network / no mic)
 ```
 
 Pi loads the extension via [jiti](https://github.com/unjs/jiti), so TypeScript
-runs without a build step. Edit `src/index.ts` and use `/reload` (for
-auto-discovered installs) to pick up changes.
+runs without a build step. Edit sources and use `/reload` (for auto-discovered
+installs) to pick up changes.
 
 ## Try it
 
@@ -55,77 +70,133 @@ Once loaded:
 
 - Ask the agent: *"Use the hello tool to greet Sam."*
 - Or type the command: `/hello Sam`
-- Voice status stub: `/voice` or `/voice status` (reports `idle`; no mic/network yet)
+- Voice: `/voice status`, then `/voice start` (see setup below)
 
-## Voice (foundation)
+---
 
-VS0 skeleton for hands-free voice control (epic
-[#6](https://github.com/BlockedPath/pi-live/issues/6), slice
-[#7](https://github.com/BlockedPath/pi-live/issues/7)). Full plan:
-[`docs/voice-realtime-plan.md`](../../docs/voice-realtime-plan.md).
+## Voice transcription MVP
 
-Module layout under `src/voice/`
+Hands-free dictate → final transcript → `pi.sendUserMessage` → coding turn.
+
+### Prerequisites
+
+1. **Auth (pick one)**
+   - **Codex / ChatGPT OAuth (preferred):** be logged in so
+     `~/.codex/auth.json` exists with `auth_mode: "chatgpt"`.  
+     Typical path: install and run [Codex CLI](https://github.com/openai/codex)
+     once (`codex login`) or use the ChatGPT desktop app’s Codex integration.
+   - **API key fallback:** set `OPENAI_API_KEY` or `PI_VOICE_API_KEY`.
+
+2. **Microphone capture (SoX)**  
+   PCM16 mono @ 24 kHz via CLI `rec` / `sox` (no native Node addons):
+
+   ```bash
+   # macOS
+   brew install sox
+   ```
+
+   Confirm: `which rec || which sox`.
+
+3. **Network** to `wss://api.openai.com/v1/realtime`.
+
+### Commands
+
+```
+/voice                 # toggle start/stop
+/voice start           # connect + capture + stream
+/voice stop            # close WS + stop mic
+/voice status          # mode, state, auth preference/mode (no secrets)
+/voice toggle          # same as bare /voice
+```
+
+Footer status (when UI is available) updates live:
+- `voice: ● listening · waiting for mic…` — capture not producing chunks yet
+- `voice: ● listening · mic silent? (lvl 0%)` — chunks arrive but look like silence (wrong input device / muted)
+- `voice: ● listening · lvl 42%` — mic energy detected
+- `voice: hearing…` / `voice: hearing: <partial>` — server VAD + partial transcript
+- `voice: pi working…` — capture gated while the agent runs
+
+`/voice status` also prints `micChunks`, `lvl`, and any `partial`.
+
+### Privacy
+
+**Microphone audio is streamed to OpenAI’s Realtime API** for transcription.
+Do not use `/voice start` on sensitive audio. Tokens from `~/.codex/auth.json`
+or API keys are never written into pi session transcripts or status lines.
+
+### Config (`PI_VOICE_*`)
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PI_VOICE_MODE` | `transcription` | `transcription` (MVP). `conversational` comes later (#14). |
+| `PI_VOICE_MODEL` | `gpt-realtime-2.1` | Realtime model id |
+| `PI_VOICE_VOICE` | `marin` | TTS voice (unused in transcription MVP) |
+| `PI_VOICE_AUTH` | `auto` | `auto` \| `codex` \| `api-key` |
+| `PI_VOICE_CODEX_HOME` | `~/.codex` | Where to read `auth.json` |
+| `PI_VOICE_SAMPLE_RATE` | `24000` | PCM rate |
+| `PI_VOICE_API_KEY` | *(unset)* | Explicit API key override (else `OPENAI_API_KEY`) |
+| `PI_VOICE_INPUT_DEVICE` | *(system default)* | CoreAudio device name, e.g. `iPhone Microphone` or `MacBook Air Microphone` |
+| `PI_VOICE_RELAY_TARGET` | *(unset)* | Herdr agent name or pane id — finals go via `herdr agent prompt <target> …` |
+| `PI_VOICE_RELAY_MODE` | `local` (or `relay` if target set) | `local` \| `relay` \| `both` |
+
+### Manual test
+
+```bash
+# --- Local Ghostty pane (mic works; satellite voice) ---
+cd extensions/pi-live && npm install
+export PI_VOICE_RELAY_TARGET=vs5-session   # main coding agent name or pane id
+# export PI_VOICE_RELAY_MODE=relay          # default when target is set
+# export PI_VOICE_INPUT_DEVICE='MacBook Air Microphone'
+pi -e ./src/index.ts
+# /voice start  → speak → transcript lands on main agent via herdr
+
+# --- Main coding pane (can be SSH/Herdr; no mic needed) ---
+# herdr agent list   # confirm unique name, e.g. vs5-session
+```
+
+### Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| `No voice auth available` / `missing_auth` | `ls ~/.codex/auth.json` or set `OPENAI_API_KEY` / `PI_VOICE_API_KEY`. Prefer `PI_VOICE_AUTH=codex` or `api-key` to force one path. |
+| `sox/rec not found on PATH` | `brew install sox`; ensure Homebrew’s bin is on `PATH` inside the pi process. |
+| WS 401 / 403 | OAuth expired — re-login via Codex; or switch to a valid API key. |
+| WS closes immediately | Model id / account entitlements; try `PI_VOICE_MODEL=gpt-realtime-mini` if available on your account. |
+| No transcript / silence | OS mic permission for the terminal app; correct default input device; watch `/voice status` stays `listening`. |
+| `micChunks` rising but `lvl=0%` / `mic silent` | **Capture works; the device is silent.** On macOS: System Settings → Privacy & Security → **Microphone** → enable **Ghostty** (or whatever hosts the shell). Confirm default input is the real mic. Or force a device: `PI_VOICE_INPUT_DEVICE='iPhone Microphone'` (restart pi). CLI check while speaking: `sox -t coreaudio "iPhone Microphone" -n stat trim 0 1` — `Maximum amplitude` should be ≫ 0. |
+| Transcript but pi does nothing | Bridge needs the extension’s `sendUserMessage`; ensure you started voice from inside pi (not a bare unit test). |
+| Capture never resumes | Agent should fire `agent_settled`; `/voice stop` then `/voice start` recovers. |
+
+### Module layout (`src/voice/`)
 
 | File | Role |
 | --- | --- |
 | `types.ts` | Shared contracts (auth, session, transcripts, bridge) |
 | `config.ts` | `PI_VOICE_*` env → typed config |
-| `session.ts` | Idle stub (`getStatus` / `getState`) |
+| `auth.ts` | Codex OAuth load/refresh + API key fallback |
+| `realtime-client.ts` | GA Realtime WebSocket client |
+| `capture.ts` | mic → PCM16 mono via sox/rec |
+| `bridge.ts` | final text → `pi.sendUserMessage` (idle / steer) |
+| `session.ts` | start/stop/status state machine |
 | `index.ts` | Public barrel |
 
-Config defaults (override via env):
+### Later slices (not in this MVP)
 
-| Variable | Default |
-| --- | --- |
-| `PI_VOICE_MODE` | `transcription` |
-| `PI_VOICE_MODEL` | `gpt-realtime-2.1` |
-| `PI_VOICE_VOICE` | `marin` |
-| `PI_VOICE_AUTH` | `auto` |
-| `PI_VOICE_CODEX_HOME` | `~/.codex` |
-| `PI_VOICE_SAMPLE_RATE` | `24000` |
+- #13 playback / speak-back  
+- #14 conversational mode + `pi_turn` tool  
+- #15 polish (partials widget, reconnect, PTT)  
+- #16 optional Codex app-server backend  
 
-Later slices (do not implement here): auth (#8), realtime client (#9), mic
-capture (#10), pi bridge (#11), session MVP (#12).
-
-Dependency `ws` is declared now so Wave 1 realtime work does not thrash
-`package.json`.
+Session hooks already reserved for those: `onTranscript`, `onStateChange`,
+`setCapturePaused`.
 
 ## Layout
 
 ```
 extensions/pi-live/
-├── package.json   # declares the pi extension entrypoint + deps
-├── tsconfig.json   # strict TS config for typechecking
+├── package.json   # pi extension entrypoint + deps
+├── tsconfig.json
 └── src/
-    ├── index.ts    # extension entry (hello + /voice status)
-    └── voice/      # voice foundation (types, config, idle session stub)
+    ├── index.ts   # extension entry (hello + /voice)
+    └── voice/     # auth, realtime, capture, bridge, session
 ```
-
-## Active plan: realtime voice
-
-The next major feature is hands-free voice control. Full plan:
-
-[docs/voice-realtime-plan.md](../../docs/voice-realtime-plan.md)
-
-Summary:
-
-1. **Phase 0** — ChatGPT OAuth (`~/.codex/auth.json`) + Realtime `session.created` spike
-2. **Phase 1** — Transcription MVP: mic → transcript → `pi.sendUserMessage`
-3. **Phase 2** — Playback / polish
-4. **Phase 3** — Conversational mode with `pi_turn` tool
-5. **Phase 4** — Optional Codex app-server V3 bridge
-
-## Next steps (general)
-
-Good things to add next:
-
-- realtime voice (see plan above)
-- more tools (see `pi.registerTool` + `defineTool`)
-- a `tool_call` gate that blocks dangerous commands
-- a custom command (`pi.registerCommand`)
-- persisted state via `pi.appendEntry`
-- voice MVP slices #8–#12 (auth, realtime, capture, bridge, session)
-
-See the upstream
-[extension docs](https://github.com/earendil-works/pi-coding-agent/blob/main/docs/extensions.md)
-and [examples](https://github.com/earendil-works/pi-coding-agent/tree/main/examples/extensions).

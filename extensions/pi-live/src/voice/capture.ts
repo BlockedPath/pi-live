@@ -2,18 +2,20 @@
  * Mic capture via CLI `sox` / `rec` (VS3 / issue #10).
  *
  * Streams PCM16 LE mono at the configured sample rate (default 24 kHz) from the
- * system default input device. No native Node addons, no browser/GUI.
+ * system default input device, or a named device via `device` /
+ * `PI_VOICE_INPUT_DEVICE` (e.g. Continuity "iPhone Microphone" on macOS).
  *
- * Requires SoX on PATH (`brew install sox` on macOS). `rec` is preferred when
- * present; otherwise `sox -d` is used.
+ * Requires SoX on PATH (`brew install sox` on macOS). `rec` is preferred for
+ * the default device; named devices use `sox -t coreaudio "…"` on Darwin.
  *
  * Manual check (optional):
- *   node --input-type=module -e "
- *     import { MicCapture } from './extensions/pi-live/src/voice/capture.ts';
- *     const m = new MicCapture();
- *     await m.start((c) => console.log('chunk', c.byteLength, m.backend));
- *     setTimeout(() => m.stop(), 2000);
- *   "
+ *   PI_VOICE_INPUT_DEVICE='iPhone Microphone' \\
+ *     node --input-type=module -e "
+ *       import { MicCapture } from './src/voice/capture.ts';
+ *       const m = new MicCapture({ device: process.env.PI_VOICE_INPUT_DEVICE });
+ *       await m.start((c) => console.log('chunk', c.byteLength, m.backend));
+ *       setTimeout(() => m.stop(), 2000);
+ *     "
  */
 
 import { type ChildProcessByStdio, spawn } from "node:child_process";
@@ -33,6 +35,11 @@ const DEFAULT_SAMPLE_RATE = defaultVoiceConfig.sampleRate;
 export interface MicCaptureOptions {
 	/** Target sample rate in Hz (SoX resamples the device if needed). */
 	sampleRate?: number;
+	/**
+	 * Named input device (macOS CoreAudio name, e.g. `iPhone Microphone`).
+	 * When set, uses `sox -t coreaudio "<name>"` instead of the default device.
+	 */
+	device?: string;
 }
 
 /**
@@ -60,13 +67,14 @@ interface Backend {
 	label: string;
 	command: string;
 	args: string[];
+	/** Device name when a non-default input was requested. */
+	device?: string;
 }
 
-function resolveBackend(sampleRate: number): Backend {
+function pcmOutputArgs(sampleRate: number): string[] {
 	const rate = String(sampleRate);
 	// signed-integer 16-bit LE mono raw PCM on stdout
-	const pcmArgs = [
-		"-q", // quiet — no progress meter on stderr
+	return [
 		"-c",
 		"1",
 		"-r",
@@ -78,12 +86,42 @@ function resolveBackend(sampleRate: number): Backend {
 		"-t",
 		"raw",
 		"-", // stdout
-	] as const;
+	];
+}
+
+function resolveBackend(sampleRate: number, device?: string): Backend {
+	const outArgs = pcmOutputArgs(sampleRate);
+	const named = device?.trim() || undefined;
+
+	// Named device: prefer sox + coreaudio on Darwin; fall back to sox -d style name.
+	if (named) {
+		const sox = findOnPath(["sox"]);
+		if (!sox) throw new Error(INSTALL_HINT);
+		if (process.platform === "darwin") {
+			return {
+				label: `sox:coreaudio:${named}`,
+				command: sox,
+				device: named,
+				args: ["-q", "-t", "coreaudio", named, ...outArgs],
+			};
+		}
+		// Non-macOS: treat name as SoX input path/device string.
+		return {
+			label: `sox:${named}`,
+			command: sox,
+			device: named,
+			args: ["-q", named, ...outArgs],
+		};
+	}
 
 	const rec = findOnPath(["rec"]);
 	if (rec) {
 		// rec ≡ sox -d: records from the default capture device.
-		return { label: "rec", command: rec, args: [...pcmArgs] };
+		return {
+			label: "rec",
+			command: rec,
+			args: ["-q", ...outArgs],
+		};
 	}
 
 	const sox = findOnPath(["sox"]);
@@ -91,7 +129,7 @@ function resolveBackend(sampleRate: number): Backend {
 		return {
 			label: "sox",
 			command: sox,
-			args: ["-q", "-d", ...pcmArgs.slice(1)],
+			args: ["-q", "-d", ...outArgs],
 		};
 	}
 
@@ -106,12 +144,16 @@ function resolveBackend(sampleRate: number): Backend {
  */
 export class MicCapture implements MicCaptureLike {
 	readonly #sampleRate: number;
+	readonly #device: string | undefined;
 	#backendLabel = "none";
 	#child: ChildProcessByStdio<null, Readable, Readable> | null = null;
 	#stopping: Promise<void> | null = null;
 	#onChunk: ((pcm: Buffer) => void) | null = null;
 	/** Leftover byte when a chunk ends on an odd boundary (PCM16 = 2 bytes/sample). */
 	#pending: Buffer | null = null;
+	#stderrBuf = "";
+	#onUnexpectedExit: ((info: { code: number | null; signal: string | null; stderr: string }) => void) | null =
+		null;
 
 	constructor(options: MicCaptureOptions = {}) {
 		const rate = options.sampleRate ?? DEFAULT_SAMPLE_RATE;
@@ -119,11 +161,18 @@ export class MicCapture implements MicCaptureLike {
 			throw new Error(`invalid sampleRate: ${String(options.sampleRate)}`);
 		}
 		this.#sampleRate = Math.trunc(rate);
+		const dev = options.device?.trim();
+		this.#device = dev || undefined;
 	}
 
-	/** Active capture backend (`rec`, `sox`, or `none` before first start). */
+	/** Active capture backend (`rec`, `sox`, `sox:coreaudio:…`, or `none`). */
 	get backend(): string {
 		return this.#backendLabel;
+	}
+
+	/** Configured named input device, if any. */
+	get device(): string | undefined {
+		return this.#device;
 	}
 
 	/** Configured output sample rate in Hz. */
@@ -134,6 +183,21 @@ export class MicCapture implements MicCaptureLike {
 	/** True while a capture child is running. */
 	get isRunning(): boolean {
 		return this.#child !== null && this.#stopping === null;
+	}
+
+	/** Recent stderr from the capture process (truncated). */
+	get lastStderr(): string {
+		return this.#stderrBuf;
+	}
+
+	/**
+	 * Optional hook when the capture process dies unexpectedly after a successful start.
+	 * Not called during an intentional {@link stop}.
+	 */
+	onUnexpectedExit(
+		handler: ((info: { code: number | null; signal: string | null; stderr: string }) => void) | null,
+	): void {
+		this.#onUnexpectedExit = handler;
 	}
 
 	/**
@@ -152,10 +216,11 @@ export class MicCapture implements MicCaptureLike {
 			await this.#stopping;
 		}
 
-		const backend = resolveBackend(this.#sampleRate);
+		const backend = resolveBackend(this.#sampleRate, this.#device);
 		this.#backendLabel = backend.label;
 		this.#onChunk = onChunk;
 
+		this.#stderrBuf = "";
 		const child = spawn(backend.command, backend.args, {
 			stdio: ["ignore", "pipe", "pipe"],
 			// Detach from a controlling TTY so SoX device prompts don't steal input.
@@ -167,6 +232,10 @@ export class MicCapture implements MicCaptureLike {
 
 		child.stdout.on("data", (chunk: Buffer) => {
 			this.#emitPcm(chunk);
+		});
+		child.stderr.on("data", (chunk: Buffer) => {
+			const text = chunk.toString("utf8");
+			this.#stderrBuf = `${this.#stderrBuf}${text}`.slice(-2000);
 		});
 
 		// Surface spawn-time failures (ENOENT etc.) before we resolve.
@@ -193,15 +262,24 @@ export class MicCapture implements MicCaptureLike {
 			};
 
 			// If the process exits immediately, treat it as a failure to start.
-			const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+			const onExit = (
+				code: number | null,
+				signal: NodeJS.Signals | null,
+			): void => {
 				if (settled) return;
 				settled = true;
 				cleanup();
+				const errTail = this.#stderrBuf.trim();
 				this.#cleanupChild();
 				let detail = "unknown reason";
 				if (code !== null) detail = `exit code ${code}`;
 				else if (signal) detail = `signal ${signal}`;
-				reject(new Error(`mic capture failed to start (${backend.label}: ${detail})`));
+				const extra = errTail ? `: ${errTail.slice(-300)}` : "";
+				reject(
+					new Error(
+						`mic capture failed to start (${backend.label}: ${detail})${extra}`,
+					),
+				);
 			};
 
 			const cleanup = (): void => {
@@ -223,9 +301,21 @@ export class MicCapture implements MicCaptureLike {
 
 		// After a successful start, clear child state when the process ends so
 		// a later start() can respawn without an explicit stop().
-		child.once("exit", () => {
-			if (this.#child === child) {
-				this.#cleanupChild();
+		child.once("exit", (code, signal) => {
+			if (this.#child !== child) return;
+			const intentional = this.#stopping !== null;
+			const stderr = this.#stderrBuf;
+			this.#cleanupChild();
+			if (!intentional) {
+				try {
+					this.#onUnexpectedExit?.({
+						code,
+						signal,
+						stderr,
+					});
+				} catch {
+					// ignore listener errors
+				}
 			}
 		});
 		child.once("error", () => {

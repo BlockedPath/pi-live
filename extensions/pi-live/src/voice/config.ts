@@ -9,6 +9,8 @@ import { join } from "node:path";
 
 import type { VoiceAuthPrefer, VoiceMode } from "./types.js";
 
+export type VoiceRelayMode = "local" | "relay" | "both";
+
 export interface VoiceConfig {
 	/** `transcription` (MVP) or `conversational` (later). */
 	mode: VoiceMode;
@@ -22,6 +24,25 @@ export interface VoiceConfig {
 	codexHome: string;
 	/** PCM sample rate in Hz (OpenAI Realtime GA default: 24000). */
 	sampleRate: number;
+	/**
+	 * Optional CoreAudio / SoX input device name.
+	 * Examples: `iPhone Microphone`, `MacBook Air Microphone`.
+	 * Empty/undefined → system default (`rec` / `sox -d`).
+	 */
+	inputDevice?: string;
+	/**
+	 * When set, final transcripts are also (or only) sent via
+	 * `herdr agent prompt <target> <text>`. Use a unique agent name or pane id
+	 * for the main coding session (mic often works only in a local pane).
+	 */
+	relayTarget?: string;
+	/**
+	 * How to deliver finals when `relayTarget` is set.
+	 * - `local` — only this pi (`sendUserMessage`) [default without relay]
+	 * - `relay` — only Herdr target (satellite voice pane)
+	 * - `both` — local + Herdr
+	 */
+	relayMode: VoiceRelayMode;
 	/** Optional explicit API key override (never logged). */
 	apiKey?: string;
 }
@@ -32,6 +53,7 @@ const DEFAULTS = {
 	voice: "marin",
 	auth: "auto" as VoiceAuthPrefer,
 	sampleRate: 24_000,
+	relayMode: "local" as VoiceRelayMode,
 } as const;
 
 function expandHome(path: string): string {
@@ -56,6 +78,15 @@ function parseSampleRate(raw: string | undefined): number {
 	return Number.isFinite(n) && n > 0 ? n : DEFAULTS.sampleRate;
 }
 
+function parseRelayMode(
+	raw: string | undefined,
+	hasTarget: boolean,
+): VoiceRelayMode {
+	if (raw === "local" || raw === "relay" || raw === "both") return raw;
+	// Sensible default: satellite pane when a target is configured.
+	return hasTarget ? "relay" : DEFAULTS.relayMode;
+}
+
 /**
  * Read voice settings from `env` (defaults to `process.env`).
  * Safe to call repeatedly; performs no I/O beyond env access.
@@ -68,6 +99,7 @@ export function loadVoiceConfig(
 	const apiKey =
 		env.PI_VOICE_API_KEY?.trim() || env.OPENAI_API_KEY?.trim() || undefined;
 
+	const relayTarget = env.PI_VOICE_RELAY_TARGET?.trim() || undefined;
 	return {
 		mode: parseMode(env.PI_VOICE_MODE?.trim()),
 		model: env.PI_VOICE_MODEL?.trim() || DEFAULTS.model,
@@ -75,6 +107,9 @@ export function loadVoiceConfig(
 		auth: parseAuth(env.PI_VOICE_AUTH?.trim()),
 		codexHome: expandHome(codexHomeRaw),
 		sampleRate: parseSampleRate(env.PI_VOICE_SAMPLE_RATE?.trim()),
+		inputDevice: env.PI_VOICE_INPUT_DEVICE?.trim() || undefined,
+		relayTarget,
+		relayMode: parseRelayMode(env.PI_VOICE_RELAY_MODE?.trim(), Boolean(relayTarget)),
 		apiKey: apiKey || undefined,
 	};
 }

@@ -1,14 +1,15 @@
 /**
  * Public barrel for the pi-live voice module.
  *
- * Stable export surface for parallel slices #8–#11 and integration #12.
- * Implementations land per-slice; VS0 ships types + config + idle stub; VS1 adds auth.
+ * Stable export surface across voice slices (#7–#12+).
+ * VS5 adds the real VoiceSession state machine (start/stop/status).
  */
 
 export {
 	defaultVoiceConfig,
 	loadVoiceConfig,
 	type VoiceConfig,
+	type VoiceRelayMode,
 } from "./config.js";
 
 export { MicCapture, type MicCaptureOptions } from "./capture.js";
@@ -28,6 +29,9 @@ export {
 	getSharedVoiceSession,
 	resetSharedVoiceSession,
 	VoiceSession,
+	type VoiceSessionDeps,
+	type VoiceSessionStartOptions,
+	type VoiceSessionUi,
 } from "./session.js";
 
 export {
