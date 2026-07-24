@@ -471,20 +471,32 @@ export class VoicePlayback {
 /**
  * Stream PCM16 mono realtime audio out (VS8 conversational).
  *
- * Streams chunks to sox `play` as they arrive so barge-in can kill playback
- * mid-utterance. stdin EPIPE after kill/exit is swallowed so pi does not crash.
+ * Uses a short jitter buffer before starting sox `play`, then streams with
+ * backpressure-aware queuing so audio does not underrun/glitch. `stop()`
+ * still kills playback immediately for barge-in; stdin EPIPE is swallowed.
  */
 export interface PcmStreamPlayerOptions {
 	sampleRate?: number;
 	spawn?: SpawnFn;
 	/** Streaming player binary (default: `play` from sox). */
 	command?: string;
+	/**
+	 * Ms of PCM to buffer before starting the player (smooth start).
+	 * Default ~80ms — low enough for duplex, high enough to avoid underruns.
+	 */
+	prebufferMs?: number;
 }
+
+/** Default pre-roll before opening the speaker (~80ms @ 24k mono PCM16). */
+const DEFAULT_PREBUFFER_MS = 80;
+/** Soft cap on queued PCM after the player starts (~1s). */
+const MAX_QUEUE_BYTES = 24_000 * 2 * 1;
 
 export class PcmStreamPlayer {
 	readonly #sampleRate: number;
 	readonly #spawn: SpawnFn;
 	readonly #command: string;
+	readonly #prebufferBytes: number;
 	readonly #handlers = new Set<SpeakingHandler>();
 
 	#child: ChildProcess | undefined;
@@ -493,13 +505,28 @@ export class PcmStreamPlayer {
 	#itemId: string | undefined;
 	#speaking = false;
 	#generation = 0;
-	/** True once any audio has been accepted for the current assistant turn. */
 	#hasAudio = false;
+
+	/** Pre-start jitter buffer. */
+	#prebuffer: Buffer[] = [];
+	#prebufferSize = 0;
+	/** Post-start queue for backpressure. */
+	#queue: Buffer[] = [];
+	#queueSize = 0;
+	#draining = false;
+	#started = false;
+	#ending = false;
 
 	constructor(options: PcmStreamPlayerOptions = {}) {
 		this.#sampleRate = options.sampleRate ?? 24_000;
 		this.#spawn = options.spawn ?? defaultSpawn;
 		this.#command = options.command ?? "play";
+		const ms = options.prebufferMs ?? DEFAULT_PREBUFFER_MS;
+		// PCM16 mono: 2 bytes/sample
+		this.#prebufferBytes = Math.max(
+			1024,
+			Math.floor((this.#sampleRate * 2 * ms) / 1000),
+		);
 	}
 
 	isSpeaking(): boolean {
@@ -529,7 +556,7 @@ export class PcmStreamPlayer {
 	}
 
 	/**
-	 * Append a base64 PCM16 chunk and stream it to the player immediately.
+	 * Append a base64 PCM16 chunk. Prefills a jitter buffer, then streams.
 	 */
 	appendBase64(delta: string, itemId?: string): void {
 		if (!delta) return;
@@ -542,31 +569,44 @@ export class PcmStreamPlayer {
 		if (buf.byteLength === 0) return;
 
 		if (itemId && this.#itemId && itemId !== this.#itemId) {
-			// New assistant item — restart the stream.
 			this.stop();
 		}
 		if (itemId) this.#itemId = itemId;
 
 		this.#hasAudio = true;
 		this.#bytesWritten += buf.byteLength;
-		this.#ensureChild();
+		// Mark speaking as soon as audio is arriving (UI + barge-in).
 		this.#setSpeaking(true);
-		this.#write(buf);
+
+		if (!this.#started) {
+			this.#prebuffer.push(buf);
+			this.#prebufferSize += buf.byteLength;
+			if (this.#prebufferSize >= this.#prebufferBytes) {
+				this.#startPlayer();
+			}
+			return;
+		}
+
+		this.#enqueue(buf);
+		this.#pump();
 	}
 
 	/**
-	 * End-of-audio marker from the server. Keeps the player draining; does not
-	 * block barge-in (stop() still kills immediately).
+	 * End-of-audio from the server. Flushes prebuffer if still priming, then
+	 * ends stdin after the queue drains.
 	 */
 	done(): void {
-		const child = this.#child;
-		const stdin = child?.stdin;
-		if (!stdin || stdin.destroyed || this.#stdinFailed) return;
-		try {
-			stdin.end();
-		} catch {
-			this.#stdinFailed = true;
+		this.#ending = true;
+		if (!this.#started) {
+			// Short utterance shorter than prebuffer — play what we have.
+			if (this.#prebufferSize > 0) {
+				this.#startPlayer();
+			} else {
+				this.#setSpeaking(false);
+			}
 		}
+		this.#pump();
+		this.#maybeEndStdin();
 	}
 
 	/**
@@ -583,6 +623,13 @@ export class PcmStreamPlayer {
 		this.#bytesWritten = 0;
 		this.#itemId = undefined;
 		this.#hasAudio = false;
+		this.#prebuffer = [];
+		this.#prebufferSize = 0;
+		this.#queue = [];
+		this.#queueSize = 0;
+		this.#draining = false;
+		this.#started = false;
+		this.#ending = false;
 
 		if (child) {
 			this.#teardownChild(child);
@@ -591,43 +638,121 @@ export class PcmStreamPlayer {
 		return { itemId, audioEndMs };
 	}
 
-	#write(buf: Buffer): void {
-		if (this.#stdinFailed) return;
+	#startPlayer(): void {
+		if (this.#started) return;
+		this.#started = true;
+		this.#ensureChild();
+
+		// Flush prebuffer as one contiguous write when possible.
+		if (this.#prebufferSize > 0) {
+			const primed = Buffer.concat(this.#prebuffer, this.#prebufferSize);
+			this.#prebuffer = [];
+			this.#prebufferSize = 0;
+			this.#enqueue(primed);
+		}
+		this.#pump();
+		if (this.#ending) this.#maybeEndStdin();
+	}
+
+	#enqueue(buf: Buffer): void {
+		// Drop from the head if the queue grows too large (network burst /
+		// slow speaker) — prefer staying near-live over perfect fidelity.
+		this.#queue.push(buf);
+		this.#queueSize += buf.byteLength;
+		while (this.#queueSize > MAX_QUEUE_BYTES && this.#queue.length > 1) {
+			const dropped = this.#queue.shift();
+			if (dropped) this.#queueSize -= dropped.byteLength;
+		}
+	}
+
+	#pump(): void {
+		if (this.#draining || this.#stdinFailed || !this.#started) return;
 		const child = this.#child;
 		const stdin = child?.stdin;
 		if (!stdin || stdin.destroyed || !stdin.writable) {
 			this.#stdinFailed = true;
 			return;
 		}
+
+		this.#draining = true;
 		try {
-			// write() returns false on backpressure; we drop rather than buffer
-			// unbounded audio (barge-in cares more about staying live than perfect audio).
-			stdin.write(buf, (err) => {
-				if (!err) return;
-				// Async EPIPE after play exits / is killed — must not crash pi.
-				if ((err as NodeJS.ErrnoException).code === "EPIPE") {
-					this.#stdinFailed = true;
+			while (this.#queue.length > 0) {
+				const next = this.#queue[0]!;
+				let ok = false;
+				try {
+					ok = stdin.write(next, (err) => {
+						if (!err) return;
+						if (
+							(err as NodeJS.ErrnoException).code === "EPIPE" ||
+							(err as NodeJS.ErrnoException).code === "ERR_STREAM_DESTROYED"
+						) {
+							this.#stdinFailed = true;
+							return;
+						}
+						this.#stdinFailed = true;
+					});
+				} catch (err) {
+					const code =
+						err && typeof err === "object" && "code" in err
+							? String((err as { code?: unknown }).code)
+							: "";
+					if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") {
+						this.#stdinFailed = true;
+					} else {
+						this.#stdinFailed = true;
+					}
+					break;
+				}
+
+				this.#queue.shift();
+				this.#queueSize -= next.byteLength;
+				if (this.#queueSize < 0) this.#queueSize = 0;
+
+				if (!ok) {
+					// Backpressure — resume on drain.
+					const onDrain = () => {
+						stdin.off("drain", onDrain);
+						this.#draining = false;
+						if (!this.#stdinFailed) {
+							this.#pump();
+							this.#maybeEndStdin();
+						}
+					};
+					stdin.once("drain", onDrain);
 					return;
 				}
-				this.#stdinFailed = true;
-			});
-		} catch (err) {
-			const code =
-				err && typeof err === "object" && "code" in err
-					? String((err as { code?: unknown }).code)
-					: "";
-			if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") {
-				this.#stdinFailed = true;
-				return;
 			}
+		} finally {
+			// Only clear draining if we are not waiting on drain.
+			if (!this.#stdinFailed) {
+				const waiting =
+					this.#queue.length > 0 &&
+					stdin &&
+					!stdin.destroyed &&
+					stdin.listenerCount("drain") > 0;
+				if (!waiting) this.#draining = false;
+			} else {
+				this.#draining = false;
+			}
+		}
+
+		this.#maybeEndStdin();
+	}
+
+	#maybeEndStdin(): void {
+		if (!this.#ending || this.#queue.length > 0 || this.#stdinFailed) return;
+		const stdin = this.#child?.stdin;
+		if (!stdin || stdin.destroyed) return;
+		try {
+			stdin.end();
+		} catch {
 			this.#stdinFailed = true;
 		}
 	}
 
 	#ensureChild(): void {
 		if (this.#child && !this.#child.killed && !this.#stdinFailed) return;
-		// Previous child died mid-stream — start a fresh one for remaining audio.
-		if (this.#child && (this.#child.killed || this.#stdinFailed)) {
+		if (this.#child) {
 			this.#teardownChild(this.#child);
 			this.#child = undefined;
 		}
@@ -648,8 +773,9 @@ export class PcmStreamPlayer {
 					"16",
 					"-c",
 					"1",
+					// Larger play buffer reduces underrun clicks.
 					"--buffer",
-					"256",
+					"1024",
 					"-",
 				],
 				{
@@ -660,12 +786,14 @@ export class PcmStreamPlayer {
 			this.#child = child;
 			this.#stdinFailed = false;
 
-			// Critical: without an error listener, stdin EPIPE becomes uncaughtException.
 			const stdin = child.stdin;
 			if (stdin) {
+				// Prevent uncaughtException on EPIPE after kill/exit.
 				stdin.on("error", (err: NodeJS.ErrnoException) => {
-					// Expected when play exits or stop() destroys the pipe.
-					if (err?.code === "EPIPE" || err?.code === "ERR_STREAM_DESTROYED") {
+					if (
+						err?.code === "EPIPE" ||
+						err?.code === "ERR_STREAM_DESTROYED"
+					) {
 						this.#stdinFailed = true;
 						return;
 					}
@@ -696,7 +824,7 @@ export class PcmStreamPlayer {
 		if (stdin) {
 			try {
 				stdin.removeAllListeners("error");
-				// Swallow late errors from destroy/end races.
+				stdin.removeAllListeners("drain");
 				stdin.on("error", () => undefined);
 				if (!stdin.destroyed) {
 					stdin.destroy();
