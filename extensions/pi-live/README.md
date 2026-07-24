@@ -18,6 +18,16 @@ Pick one:
 
 ### As a pi package
 
+From this directory:
+
+```bash
+pi install .
+# or project-local settings:
+pi install . -l
+```
+
+From the repo root:
+
 ```bash
 pi install ./extensions/pi-live
 ```
@@ -124,7 +134,7 @@ or API keys are never written into pi session transcripts or status lines.
 
 ```bash
 cd extensions/pi-live && npm install
-pi -e ./src/index.ts
+pi install .          # or: pi -e ./src/index.ts
 # in pi:
 /voice status
 /voice start
