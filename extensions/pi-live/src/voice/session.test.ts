@@ -257,6 +257,33 @@ describe("VoiceSession", () => {
 		assert.equal(seen.at(-1)?.type, "final");
 	});
 
+	it("relays finals to herdr target without local deliver", async () => {
+		const relayed: Array<{ target: string; text: string }> = [];
+		const client = new FakeClient();
+		const capture = new FakeCapture();
+		const delivered: string[] = [];
+		const session = new VoiceSession({
+			config: {
+				...defaultVoiceConfig,
+				relayTarget: "vs5-session",
+				relayMode: "relay",
+			},
+			resolveAuth: async () => fakeAuth(),
+			createClient: () => client,
+			createCapture: () => capture,
+			deliverText: (_pi, text) => {
+				delivered.push(text);
+			},
+			relayText: (target, text) => {
+				relayed.push({ target, text });
+			},
+		});
+		await session.start({ pi: { sendUserMessage: () => undefined } });
+		client.emitTranscriptDone("ship it");
+		assert.deepEqual(delivered, []);
+		assert.deepEqual(relayed, [{ target: "vs5-session", text: "ship it" }]);
+	});
+
 	it("stop tears down capture and client", async () => {
 		const { session, client, capture } = makeSession();
 		await session.start({ pi: { sendUserMessage: () => undefined } });

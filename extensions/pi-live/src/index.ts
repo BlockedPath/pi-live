@@ -55,6 +55,8 @@ function formatVoiceStatus(): string {
 	if (info.hearing) parts.push("hearing=yes");
 	if (info.inputDevice) parts.push(`in=${info.inputDevice}`);
 	if (info.captureBackend) parts.push(`backend=${info.captureBackend}`);
+	if (info.relayTarget) parts.push(`relay=${info.relayTarget}`);
+	if (info.relayMode && info.relayMode !== "local") parts.push(`relayMode=${info.relayMode}`);
 	if (typeof info.audioChunks === "number") {
 		parts.push(`micChunks=${info.audioChunks}`);
 	}

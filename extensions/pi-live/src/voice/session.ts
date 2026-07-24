@@ -8,6 +8,7 @@
  *
  * State machine: idle → connecting → listening → stopping → idle (+ error)
  */
+import { spawn } from "node:child_process";
 
 import { resolveVoiceAuth, VoiceAuthError } from "./auth.js";
 import {
@@ -65,6 +66,8 @@ export interface VoiceSessionDeps {
 		text: string,
 		opts?: DeliverVoiceTextCallOptions,
 	) => void;
+	/** Override Herdr relay (tests). Default: `herdr agent prompt <target> <text>`. */
+	relayText?: (target: string, text: string) => void;
 }
 
 type Unsubscribe = () => void;
@@ -97,6 +100,7 @@ export class VoiceSession {
 	readonly #createClient: NonNullable<VoiceSessionDeps["createClient"]>;
 	readonly #createCapture: NonNullable<VoiceSessionDeps["createCapture"]>;
 	readonly #deliverText: NonNullable<VoiceSessionDeps["deliverText"]>;
+	readonly #relayText: NonNullable<VoiceSessionDeps["relayText"]>;
 
 	#state: VoiceSessionState = "idle";
 	#error: string | undefined;
@@ -148,6 +152,7 @@ export class VoiceSession {
 					device: opts.device,
 				}));
 		this.#deliverText = deps.deliverText ?? deliverVoiceText;
+		this.#relayText = deps.relayText ?? defaultHerdrRelay;
 	}
 
 	/** Current lifecycle state. */
@@ -216,6 +221,8 @@ export class VoiceSession {
 			audioLevel: this.#audioLevel,
 			inputDevice: this.#config.inputDevice,
 			captureBackend: this.#captureBackend,
+			relayTarget: this.#config.relayTarget,
+			relayMode: this.#config.relayMode,
 			error: this.#error,
 		};
 	}
@@ -595,22 +602,49 @@ export class VoiceSession {
 		const text = event.text?.trim() ?? "";
 		if (!text) return;
 
-		const pi = this.#pi;
-		if (!pi) {
-			this.#notify(
-				`voice transcript (no bridge): ${truncate(text, 80)}`,
-				"warning",
-			);
-			return;
+		const mode = this.#config.relayMode;
+		const target = this.#config.relayTarget?.trim();
+		const doLocal = mode === "local" || mode === "both" || !target;
+		const doRelay = Boolean(target) && (mode === "relay" || mode === "both");
+
+		if (doLocal) {
+			const pi = this.#pi;
+			if (!pi) {
+				if (!doRelay) {
+					this.#notify(
+						`voice transcript (no bridge): ${truncate(text, 80)}`,
+						"warning",
+					);
+					return;
+				}
+			} else {
+				try {
+					this.#deliverText(pi, text, {
+						isIdle: () => this.#probeIdle(),
+					});
+					this.#notify(`voice → pi: ${truncate(text, 60)}`, "info");
+				} catch (err) {
+					this.#notify(
+						`voice bridge failed: ${errorMessage(err)}`,
+						"error",
+					);
+				}
+			}
 		}
 
-		try {
-			this.#deliverText(pi, text, {
-				isIdle: () => this.#probeIdle(),
-			});
-			this.#notify(`voice → pi: ${truncate(text, 60)}`, "info");
-		} catch (err) {
-			this.#notify(`voice bridge failed: ${errorMessage(err)}`, "error");
+		if (doRelay && target) {
+			try {
+				this.#relayText(target, text);
+				this.#notify(
+					`voice → herdr:${target}: ${truncate(text, 50)}`,
+					"info",
+				);
+			} catch (err) {
+				this.#notify(
+					`voice herdr relay failed: ${errorMessage(err)}`,
+					"error",
+				);
+			}
 		}
 	}
 
@@ -757,6 +791,28 @@ function pcmLevel01(pcm: Uint8Array): number {
 	}
 	if (peak < SILENCE_ABS) return 0;
 	return Math.min(1, peak / 32768);
+}
+
+/**
+ * Fire-and-forget Herdr prompt into another agent/pane.
+ * Requires `herdr` on PATH and a live Herdr session that can see the target.
+ */
+function defaultHerdrRelay(target: string, text: string): void {
+	const child = spawn(
+		"herdr",
+		["agent", "prompt", target, text],
+		{
+			stdio: "ignore",
+			detached: true,
+			env: process.env,
+		},
+	);
+	child.unref();
+	child.on("error", (err) => {
+		// Surface via uncaught? Session already notified on throw only.
+		// spawn errors are async — log-free; caller may not hear this.
+		void err;
+	});
 }
 
 /** Process-wide session for the `/voice` command. */

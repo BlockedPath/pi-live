@@ -9,6 +9,7 @@ export {
 	defaultVoiceConfig,
 	loadVoiceConfig,
 	type VoiceConfig,
+	type VoiceRelayMode,
 } from "./config.js";
 
 export { MicCapture, type MicCaptureOptions } from "./capture.js";

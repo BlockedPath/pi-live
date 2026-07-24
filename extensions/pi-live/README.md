@@ -136,18 +136,22 @@ or API keys are never written into pi session transcripts or status lines.
 | `PI_VOICE_SAMPLE_RATE` | `24000` | PCM rate |
 | `PI_VOICE_API_KEY` | *(unset)* | Explicit API key override (else `OPENAI_API_KEY`) |
 | `PI_VOICE_INPUT_DEVICE` | *(system default)* | CoreAudio device name, e.g. `iPhone Microphone` or `MacBook Air Microphone` |
+| `PI_VOICE_RELAY_TARGET` | *(unset)* | Herdr agent name or pane id — finals go via `herdr agent prompt <target> …` |
+| `PI_VOICE_RELAY_MODE` | `local` (or `relay` if target set) | `local` \| `relay` \| `both` |
 
 ### Manual test
 
 ```bash
+# --- Local Ghostty pane (mic works; satellite voice) ---
 cd extensions/pi-live && npm install
-pi install .          # or: pi -e ./src/index.ts
-# in pi:
-/voice status
-/voice start
-# speak: "list files in this repo"
-# expect a user turn + agent work; footer shows listening / pi working…
-/voice stop
+export PI_VOICE_RELAY_TARGET=vs5-session   # main coding agent name or pane id
+# export PI_VOICE_RELAY_MODE=relay          # default when target is set
+# export PI_VOICE_INPUT_DEVICE='MacBook Air Microphone'
+pi -e ./src/index.ts
+# /voice start  → speak → transcript lands on main agent via herdr
+
+# --- Main coding pane (can be SSH/Herdr; no mic needed) ---
+# herdr agent list   # confirm unique name, e.g. vs5-session
 ```
 
 ### Troubleshooting

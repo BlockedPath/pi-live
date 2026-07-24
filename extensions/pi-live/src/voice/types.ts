@@ -81,6 +81,10 @@ export interface VoiceSessionStatus {
 	inputDevice?: string;
 	/** Capture backend label (`rec`, `sox:coreaudio:…`). */
 	captureBackend?: string;
+	/** Herdr agent/pane target when relaying finals. */
+	relayTarget?: string;
+	/** Delivery mode: local | relay | both. */
+	relayMode?: string;
 	/** Present when `state === "error"`. */
 	error?: string;
 }
