@@ -472,8 +472,7 @@ export class VoicePlayback {
  * Stream PCM16 mono realtime audio out (VS8 conversational).
  *
  * Streams chunks to sox `play` as they arrive so barge-in can kill playback
- * mid-utterance. `stop()` immediately SIGTERMs the player and reports
- * audio_end_ms for conversation.item.truncate.
+ * mid-utterance. stdin EPIPE after kill/exit is swallowed so pi does not crash.
  */
 export interface PcmStreamPlayerOptions {
 	sampleRate?: number;
@@ -552,16 +551,7 @@ export class PcmStreamPlayer {
 		this.#bytesWritten += buf.byteLength;
 		this.#ensureChild();
 		this.#setSpeaking(true);
-
-		const child = this.#child;
-		if (!child?.stdin || this.#stdinFailed || child.stdin.destroyed) {
-			return;
-		}
-		try {
-			child.stdin.write(buf);
-		} catch {
-			this.#stdinFailed = true;
-		}
+		this.#write(buf);
 	}
 
 	/**
@@ -570,12 +560,12 @@ export class PcmStreamPlayer {
 	 */
 	done(): void {
 		const child = this.#child;
-		if (child?.stdin && !child.stdin.destroyed) {
-			try {
-				child.stdin.end();
-			} catch {
-				// ignore
-			}
+		const stdin = child?.stdin;
+		if (!stdin || stdin.destroyed || this.#stdinFailed) return;
+		try {
+			stdin.end();
+		} catch {
+			this.#stdinFailed = true;
 		}
 	}
 
@@ -589,36 +579,59 @@ export class PcmStreamPlayer {
 		this.#generation++;
 		const child = this.#child;
 		this.#child = undefined;
-		this.#stdinFailed = false;
+		this.#stdinFailed = true;
 		this.#bytesWritten = 0;
 		this.#itemId = undefined;
 		this.#hasAudio = false;
+
 		if (child) {
-			try {
-				// Kill process group if possible so play/sox children die too.
-				if (typeof child.pid === "number" && child.pid > 0) {
-					try {
-						process.kill(-child.pid, "SIGKILL");
-					} catch {
-						child.kill("SIGKILL");
-					}
-				} else {
-					child.kill("SIGKILL");
-				}
-			} catch {
-				try {
-					child.kill("SIGTERM");
-				} catch {
-					// ignore
-				}
-			}
+			this.#teardownChild(child);
 		}
 		this.#setSpeaking(false);
 		return { itemId, audioEndMs };
 	}
 
+	#write(buf: Buffer): void {
+		if (this.#stdinFailed) return;
+		const child = this.#child;
+		const stdin = child?.stdin;
+		if (!stdin || stdin.destroyed || !stdin.writable) {
+			this.#stdinFailed = true;
+			return;
+		}
+		try {
+			// write() returns false on backpressure; we drop rather than buffer
+			// unbounded audio (barge-in cares more about staying live than perfect audio).
+			stdin.write(buf, (err) => {
+				if (!err) return;
+				// Async EPIPE after play exits / is killed — must not crash pi.
+				if ((err as NodeJS.ErrnoException).code === "EPIPE") {
+					this.#stdinFailed = true;
+					return;
+				}
+				this.#stdinFailed = true;
+			});
+		} catch (err) {
+			const code =
+				err && typeof err === "object" && "code" in err
+					? String((err as { code?: unknown }).code)
+					: "";
+			if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") {
+				this.#stdinFailed = true;
+				return;
+			}
+			this.#stdinFailed = true;
+		}
+	}
+
 	#ensureChild(): void {
-		if (this.#child && !this.#child.killed) return;
+		if (this.#child && !this.#child.killed && !this.#stdinFailed) return;
+		// Previous child died mid-stream — start a fresh one for remaining audio.
+		if (this.#child && (this.#child.killed || this.#stdinFailed)) {
+			this.#teardownChild(this.#child);
+			this.#child = undefined;
+		}
+
 		const gen = this.#generation;
 		try {
 			const child = this.#spawn(
@@ -642,26 +655,67 @@ export class PcmStreamPlayer {
 				{
 					stdio: ["pipe", "ignore", "ignore"],
 					env: process.env,
-					// Detached so we can kill the whole group on barge-in.
-					detached: true,
 				},
 			);
 			this.#child = child;
 			this.#stdinFailed = false;
+
+			// Critical: without an error listener, stdin EPIPE becomes uncaughtException.
+			const stdin = child.stdin;
+			if (stdin) {
+				stdin.on("error", (err: NodeJS.ErrnoException) => {
+					// Expected when play exits or stop() destroys the pipe.
+					if (err?.code === "EPIPE" || err?.code === "ERR_STREAM_DESTROYED") {
+						this.#stdinFailed = true;
+						return;
+					}
+					this.#stdinFailed = true;
+				});
+			}
+
 			child.on("error", () => {
 				if (gen !== this.#generation) return;
-				this.#child = undefined;
 				this.#stdinFailed = true;
+				if (this.#child === child) this.#child = undefined;
 				this.#setSpeaking(false);
 			});
 			child.on("close", () => {
 				if (gen !== this.#generation) return;
+				this.#stdinFailed = true;
 				if (this.#child === child) this.#child = undefined;
 				this.#setSpeaking(false);
 			});
 		} catch {
 			this.#child = undefined;
 			this.#stdinFailed = true;
+		}
+	}
+
+	#teardownChild(child: ChildProcess): void {
+		const stdin = child.stdin;
+		if (stdin) {
+			try {
+				stdin.removeAllListeners("error");
+				// Swallow late errors from destroy/end races.
+				stdin.on("error", () => undefined);
+				if (!stdin.destroyed) {
+					stdin.destroy();
+				}
+			} catch {
+				// ignore
+			}
+		}
+		try {
+			if (!child.killed) {
+				child.kill("SIGKILL");
+			}
+		} catch {
+			// ignore
+		}
+		try {
+			child.removeAllListeners();
+		} catch {
+			// ignore
 		}
 	}
 
