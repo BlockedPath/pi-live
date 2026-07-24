@@ -12,6 +12,12 @@ export {
 } from "./config.js";
 
 export {
+	deliverVoiceText,
+	type DeliverVoiceTextCallOptions,
+	type VoiceBridgePi,
+} from "./bridge.js";
+
+export {
 	getSharedVoiceSession,
 	resetSharedVoiceSession,
 	VoiceSession,
