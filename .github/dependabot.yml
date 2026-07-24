@@ -1,0 +1,34 @@
+version: 2
+updates:
+  # Keep the pi extension's npm dependencies fresh.
+  - package-ecosystem: npm
+    directory: /extensions/pi-live
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    commit-message:
+      prefix: deps
+      include: scope
+    groups:
+      pi:
+        patterns:
+          - "@earendil-works/*"
+      types:
+        patterns:
+          - "typescript"
+
+  # Keep GitHub Actions versions current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: ci
+      include: scope

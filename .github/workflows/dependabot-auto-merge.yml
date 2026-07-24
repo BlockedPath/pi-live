@@ -1,0 +1,37 @@
+name: Dependabot auto-merge
+
+on:
+  # Use pull_request_target so the workflow runs with the base branch's
+  # permissions and secrets, letting it merge Dependabot PRs safely.
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    name: auto-merge
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Approve and auto-merge non-major updates
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+        run: |
+          # Leave major updates for manual review; auto-merge patch/minor.
+          if [ "$UPDATE_TYPE" = "version-update:semver-major" ]; then
+            echo "Major update — leaving for manual review."
+            exit 0
+          fi
+          gh pr review --approve "$PR_URL" || true
+          gh pr merge --auto --squash "$PR_URL"
