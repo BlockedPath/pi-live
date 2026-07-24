@@ -42,7 +42,7 @@ export type VoiceMode = "transcription" | "conversational";
 
 /**
  * Lifecycle state of a voice session.
- * VS0 stub is always `"idle"`; full machine lands in #12.
+ * Full machine: idle → connecting → listening → stopping → idle (+ error).
  */
 export type VoiceSessionState =
 	| "idle"
@@ -59,9 +59,16 @@ export interface VoiceSessionStatus {
 	mode: VoiceMode;
 	/** Configured auth preference (not a resolved secret). */
 	auth: VoiceAuthPrefer;
+	/**
+	 * Resolved credential mode after a successful connect (`chatgpt` | `api-key`).
+	 * Omitted while idle / before auth resolves. Never includes secrets.
+	 */
+	authMode?: VoiceAuthMode;
 	model: string;
 	voice: string;
 	sampleRate: number;
+	/** True when mic chunks are gated (e.g. while the agent is working). */
+	capturePaused?: boolean;
 	/** Present when `state === "error"`. */
 	error?: string;
 }
