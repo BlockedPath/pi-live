@@ -10,6 +10,15 @@ assignees: ""
 
 <!-- A short description of the problem. -->
 
+## Priority
+
+<!-- Check one. Maintainers will apply the matching P0/P1/P2 label. -->
+
+- [ ] P0 — critical/blocking, act immediately
+- [ ] P1 — high, should be next up
+- [ ] P2 — medium, normal backlog
+
+
 ## Steps to reproduce
 
 1.

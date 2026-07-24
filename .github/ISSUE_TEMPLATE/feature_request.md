@@ -10,6 +10,15 @@ assignees: ""
 
 <!-- A short description of the idea. -->
 
+## Priority
+
+<!-- Check one. Maintainers will apply the matching P0/P1/P2 label. -->
+
+- [ ] P0 — critical/blocking, act immediately
+- [ ] P1 — high, should be next up
+- [ ] P2 — medium, normal backlog
+
+
 ## Motivation
 
 <!-- What problem does this solve? Why is it useful? -->
