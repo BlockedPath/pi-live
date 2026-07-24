@@ -100,10 +100,25 @@ extensions/pi-live/
     └── voice/      # voice foundation (types, config, idle session stub)
 ```
 
-## Next steps
+## Active plan: realtime voice
+
+The next major feature is hands-free voice control. Full plan:
+
+[docs/voice-realtime-plan.md](../../docs/voice-realtime-plan.md)
+
+Summary:
+
+1. **Phase 0** — ChatGPT OAuth (`~/.codex/auth.json`) + Realtime `session.created` spike
+2. **Phase 1** — Transcription MVP: mic → transcript → `pi.sendUserMessage`
+3. **Phase 2** — Playback / polish
+4. **Phase 3** — Conversational mode with `pi_turn` tool
+5. **Phase 4** — Optional Codex app-server V3 bridge
+
+## Next steps (general)
 
 Good things to add next:
 
+- realtime voice (see plan above)
 - more tools (see `pi.registerTool` + `defineTool`)
 - a `tool_call` gate that blocks dangerous commands
 - a custom command (`pi.registerCommand`)

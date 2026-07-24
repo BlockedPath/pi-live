@@ -9,6 +9,10 @@ This repository is a working space for experimenting with pi — building, testi
 and iterating on agent workflows, custom tools, and extensions in a live
 environment.
 
+### Active plan
+
+- [Realtime voice for pi-live](docs/voice-realtime-plan.md) — OAuth-first voice control (transcription MVP → conversational mode)
+
 ## Getting started
 
 Clone the repo:
