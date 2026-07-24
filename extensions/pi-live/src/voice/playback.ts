@@ -346,11 +346,11 @@ export async function speak(
  * Session-scoped playback controller — serializes speaks, supports stop().
  */
 export class VoicePlayback {
-	readonly #backend: TtsBackend;
-	readonly #voice: string | undefined;
-	readonly #apiKey: string | undefined;
-	readonly #model: string | undefined;
-	readonly #maxChars: number;
+	#backend: TtsBackend;
+	#voice: string | undefined;
+	#apiKey: string | undefined;
+	#model: string | undefined;
+	#maxChars: number;
 	readonly #spawn: SpawnFn;
 	readonly #fetch: FetchFn;
 
@@ -371,6 +371,15 @@ export class VoicePlayback {
 
 	get backend(): TtsBackend {
 		return this.#backend;
+	}
+
+	/** Update backend/voice/apiKey after construction (prefs restore). */
+	configure(options: Partial<VoicePlaybackOptions>): void {
+		if (options.backend !== undefined) this.#backend = options.backend;
+		if (options.voice !== undefined) this.#voice = options.voice;
+		if (options.apiKey !== undefined) this.#apiKey = options.apiKey;
+		if (options.model !== undefined) this.#model = options.model;
+		if (options.maxChars !== undefined) this.#maxChars = options.maxChars;
 	}
 
 	isSpeaking(): boolean {
