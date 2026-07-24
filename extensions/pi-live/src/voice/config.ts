@@ -14,9 +14,9 @@ export type VoiceRelayMode = "local" | "relay" | "both";
 /**
  * Which realtime transport drives the voice session (VS9 / issue #16).
  * - `openai` (default) — pi talks to the OpenAI Realtime WebSocket API directly.
- * - `codex` — drive the local Codex CLI `app-server` realtime V3 session and map
+ * - `codex` — drive the local Codex CLI experimental app-server realtime and map
  *   its `thread/realtime/*` events into the existing `/voice` UX. Requires the
- *   `codex` binary on PATH; errors clearly when absent.
+ *   `codex` binary and API-key auth; errors clearly when unavailable.
  */
 export type VoiceBackend = "openai" | "codex";
 
@@ -58,7 +58,8 @@ export interface VoiceConfig {
 	apiKey?: string;
 	/**
 	 * Realtime backend selection (VS9). `openai` (default) keeps the pi-native
-	 * Realtime WebSocket path; `codex` drives `codex app-server` realtime V3.
+	 * Realtime WebSocket path; `codex` drives experimental app-server realtime
+	 * (V2 text for transcription, V3 audio for conversational).
 	 */
 	backend: VoiceBackend;
 }

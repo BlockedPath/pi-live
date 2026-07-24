@@ -673,6 +673,24 @@ describe("VoiceSession", () => {
 		assert.equal(session.isCapturePaused(), false);
 	});
 
+	it("forces API-key auth for the Codex app-server backend", async () => {
+		let prefer: string | undefined;
+		const client = new FakeClient();
+		const capture = new FakeCapture();
+		const session = new VoiceSession({
+			config: { ...defaultVoiceConfig, backend: "codex", tts: "off" },
+			resolveAuth: async (options) => {
+				prefer = options.prefer;
+				return fakeAuth();
+			},
+			createClient: () => client,
+			createCapture: () => capture,
+		});
+		await session.start({ pi: { sendUserMessage: () => undefined } });
+		assert.equal(prefer, "api-key");
+		await session.stop();
+	});
+
 	it("defaults to transcription mode", () => {
 		const { session } = makeSession();
 		assert.equal(session.getConfig().mode, "transcription");

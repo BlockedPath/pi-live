@@ -114,7 +114,7 @@ async function happyConnect(
 		params: {
 			threadId: "thr_123",
 			realtimeSessionId: "rsess_1",
-			version: "v3",
+			version: mode === "transcription" ? "v2" : "v3",
 		},
 	});
 	await connectPromise;
@@ -163,7 +163,7 @@ describe("CodexAppServerBackend — handshake", () => {
 		});
 	});
 
-	it("connects via initialize → thread/start → thread/realtime/start (v3, text modality)", async () => {
+	it("connects via initialize → thread/start → thread/realtime/start (v2 text)", async () => {
 		const transport = new FakeTransport();
 		const backend = new CodexAppServerBackend({ transport, skipDetect: true });
 		await happyConnect(backend, transport);
@@ -171,12 +171,16 @@ describe("CodexAppServerBackend — handshake", () => {
 
 		const init = transport.lastSentOfType("initialize");
 		const clientInfo = init?.clientInfo as { name?: string } | undefined;
+		const capabilities = init?.capabilities as
+			| { experimentalApi?: boolean }
+			| undefined;
 		assert.equal(clientInfo?.name, "pi-live-voice");
+		assert.equal(capabilities?.experimentalApi, true);
 
 		const realtime = transport.lastSentOfType("thread/realtime/start");
 		assert.equal(realtime?.threadId, "thr_123");
 		assert.equal(realtime?.outputModality, "text");
-		assert.equal(realtime?.version, "v3");
+		assert.equal(realtime?.version, "v2");
 		assert.equal(realtime?.model, "gpt-realtime-2.1");
 		assert.equal(realtime?.voice, "marin");
 	});
@@ -187,6 +191,7 @@ describe("CodexAppServerBackend — handshake", () => {
 		await happyConnect(backend, transport, "conversational");
 		const realtime = transport.lastSentOfType("thread/realtime/start");
 		assert.equal(realtime?.outputModality, "audio");
+		assert.equal(realtime?.version, "v3");
 	});
 
 	it("rejects when thread/realtime/error arrives before started", async () => {
@@ -211,6 +216,22 @@ describe("CodexAppServerBackend — handshake", () => {
 			assert.equal((err as CodexBackendError).code, "no_realtime");
 			return true;
 		});
+	});
+
+	it("handles a realtime start request error without an unhandled waiter", async () => {
+		const transport = new FakeTransport();
+		const backend = new CodexAppServerBackend({ transport, skipDetect: true });
+		const p = backend.connect({}, { mode: "transcription" });
+		await waitSent(transport, "initialize", 1);
+		transport.receive({ id: 1, result: { codexHome: "/tmp" } });
+		await waitSent(transport, "thread/start", 1);
+		transport.receive({ id: 2, result: { thread: { id: "thr_x" } } });
+		await waitSent(transport, "thread/realtime/start", 1);
+		transport.receive({
+			id: 3,
+			error: { code: -32600, message: "experimental capability required" },
+		});
+		await assert.rejects(p, /experimental capability required/);
 	});
 
 	it("rejects with not_running when the transport closes before started", async () => {

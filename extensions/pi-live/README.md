@@ -100,11 +100,11 @@ On the default OpenAI backend, **the Realtime model never edits files or runs sh
 | Backend | Enable | Transport | Behavior |
 | --- | --- | --- | --- |
 | **OpenAI** (default) | Leave `PI_VOICE_BACKEND` unset or set it to `openai` | Pi connects directly to the OpenAI Realtime WebSocket | Existing transcription and conversational `pi_turn` path; unchanged |
-| **Codex app-server V3** (experimental) | `PI_VOICE_BACKEND=codex` | Pi spawns local `codex app-server --stdio` and adapts `thread/realtime/*` JSON-RPC events | Reuses the same capture, status, transcript widget, playback, prefs, and transcription bridge |
+| **Codex app-server realtime** (experimental) | `PI_VOICE_BACKEND=codex` | Pi spawns local `codex app-server --stdio` and adapts `thread/realtime/*` JSON-RPC events | V2 text for transcription; V3 audio for conversational; reuses the existing session UX |
 
-The Codex backend is strictly opt-in. Missing or invalid values fall back to `openai`. It requires a recent Codex CLI with experimental realtime V3 support (the adapter was researched against the Codex 0.145.0 protocol) and a logged-in Codex session. The extension checks `codex --version` first and reports a clear error when the CLI is unavailable.
+The Codex backend is strictly opt-in. Missing or invalid values fall back to `openai`. It requires Codex CLI 0.145+ and currently requires an **OpenAI API key**; ChatGPT/Codex OAuth alone is rejected by app-server realtime. Set `OPENAI_API_KEY` or `PI_VOICE_API_KEY` before starting pi. The extension negotiates `experimentalApi`, forwards the key only to the child environment, checks `codex --version`, uses V2 for text/transcription, and uses V3 for audio/conversational.
 
-Codex V3 limitations:
+Codex realtime limitations:
 
 - **Transcription mode is recommended for coding:** final user transcripts still bridge to pi normally.
 - In conversational mode, Codex's own handoff mechanism is not mapped to pi's `pi_turn`; handoff items are ignored by this adapter.
@@ -116,12 +116,9 @@ These differences are confined to the thin `RealtimeClientLike` adapter; the def
 
 ### Prerequisites
 
-1. **Auth (pick one)**
-   - **Codex / ChatGPT OAuth (preferred):** be logged in so
-     `~/.codex/auth.json` exists with `auth_mode: "chatgpt"`.  
-     Typical path: install and run [Codex CLI](https://github.com/openai/codex)
-     once (`codex login`) or use the ChatGPT desktop app’s Codex integration.
-   - **API key fallback:** set `OPENAI_API_KEY` or `PI_VOICE_API_KEY`.
+1. **Auth**
+   - **Default OpenAI backend:** Codex / ChatGPT OAuth (`~/.codex/auth.json`) or an API key.
+   - **Codex app-server backend:** API key required by Codex 0.145 realtime. Set `OPENAI_API_KEY` or `PI_VOICE_API_KEY`; the session forces API-key auth for this backend.
 
 2. **Microphone capture (SoX)**  
    PCM16 mono @ 24 kHz via CLI `rec` / `sox` (no native Node addons):
@@ -174,7 +171,7 @@ Transcript widget (above the editor, when `setWidget` is available):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `PI_VOICE_BACKEND` | `openai` | `openai` (pi-native direct WebSocket) or `codex` (experimental local Codex app-server V3 adapter) |
+| `PI_VOICE_BACKEND` | `openai` | `openai` (pi-native direct WebSocket) or `codex` (experimental app-server realtime: V2 text / V3 audio) |
 | `PI_VOICE_MODE` | `transcription` | `transcription` (default) or `conversational` (Realtime audio + `pi_turn` on the OpenAI backend) |
 | `PI_VOICE_MODEL` | `gpt-realtime-2.1` | Realtime model id |
 | `PI_VOICE_VOICE` | `marin` | TTS voice (OpenAI names for `openai`; macOS voice name for `say`, e.g. `Samantha`) |
@@ -182,7 +179,7 @@ Transcript widget (above the editor, when `setWidget` is available):
 | `PI_VOICE_AUTH` | `auto` | `auto` \| `codex` \| `api-key` |
 | `PI_VOICE_CODEX_HOME` | `~/.codex` | Where to read `auth.json` |
 | `PI_VOICE_SAMPLE_RATE` | `24000` | PCM rate |
-| `PI_VOICE_API_KEY` | *(unset)* | Explicit API key override (else `OPENAI_API_KEY`); required for `PI_VOICE_TTS=openai` |
+| `PI_VOICE_API_KEY` | *(unset)* | Explicit API key override (else `OPENAI_API_KEY`); required for the Codex app-server backend and `PI_VOICE_TTS=openai` |
 | `PI_VOICE_INPUT_DEVICE` | *(system default)* | CoreAudio device name, e.g. `iPhone Microphone` or `MacBook Air Microphone` |
 | `PI_VOICE_RELAY_TARGET` | *(unset)* | Herdr agent name or pane id — finals go via `herdr agent prompt <target> …` |
 | `PI_VOICE_RELAY_MODE` | `local` (or `relay` if target set) | `local` \| `relay` \| `both` |
@@ -216,16 +213,17 @@ pi -e ./src/index.ts
 # /voice start  → speak a task → pi works → hears a short spoken summary
 ```
 
-### Manual test — Codex app-server V3 (experimental)
+### Manual test — Codex app-server realtime (experimental)
 
 ```bash
 cd extensions/pi-live && npm install
 codex --version
-codex login                       # if not already logged in
+export PI_VOICE_API_KEY='sk-...' # or export OPENAI_API_KEY='sk-...'
 export PI_VOICE_BACKEND=codex
-export PI_VOICE_MODE=transcription # recommended: coding stays in pi
+export PI_VOICE_MODE=transcription # uses realtime V2 text; coding stays in pi
+export PI_VOICE_TTS=off
 pi -e ./src/index.ts
-# /voice status  → includes backend=codex
+# /voice status  → includes backend=codex and authMode=api-key
 # /voice start   → speak a task → final transcript bridges into pi
 # /voice stop
 ```
@@ -266,9 +264,12 @@ Without `play`, barge-in truncate timing still works; you just won't hear audio 
 
 | Symptom | What to check |
 | --- | --- |
-| `No voice auth available` / `missing_auth` | `ls ~/.codex/auth.json` or set `OPENAI_API_KEY` / `PI_VOICE_API_KEY`. Prefer `PI_VOICE_AUTH=codex` or `api-key` to force one path. |
-| `codex backend requires the Codex CLI` | Install/update Codex, ensure `codex` is on the pi process `PATH`, run `codex --version`, and log in. Or unset `PI_VOICE_BACKEND` to use the default OpenAI backend. |
-| `codex realtime rejected start` / closes before started | The installed CLI/account may not expose experimental realtime V3. Update Codex, re-run `codex login`, or use `PI_VOICE_BACKEND=openai`. |
+| `No voice auth available` / `missing_auth` | Set `OPENAI_API_KEY` or `PI_VOICE_API_KEY`. The Codex app-server backend requires API-key auth; ChatGPT login alone is not sufficient in Codex 0.145. |
+| `codex backend requires the Codex CLI` | Install/update Codex, ensure `codex` is on the pi process `PATH`, and run `codex --version`. Or unset `PI_VOICE_BACKEND` to use the default OpenAI backend. |
+| `experimentalApi capability` | Update to the latest branch/PR version; the adapter must send `capabilities.experimentalApi=true` during initialize. |
+| `text realtime output modality requires realtime v2` | Update to the latest branch/PR version; transcription now selects V2 text automatically while conversational mode uses V3 audio. |
+| `realtime conversation requires API key auth` | Export `PI_VOICE_API_KEY` or `OPENAI_API_KEY` before launching pi. |
+| `codex realtime rejected start` | Check the full reported message, API-key validity, model/account entitlement, and Codex version. Use `PI_VOICE_BACKEND=openai` to return to the default backend. |
 | `sox/rec not found on PATH` | `brew install sox`; ensure Homebrew’s bin is on `PATH` inside the pi process. |
 | WS 401 / 403 | OAuth expired — re-login via Codex; or switch to a valid API key. |
 | WS closes immediately | Model id / account entitlements; try `PI_VOICE_MODEL=gpt-realtime-mini` if available on your account. |
@@ -290,7 +291,7 @@ Without `play`, barge-in truncate timing still works; you just won't hear audio 
 | `auth.ts` | Codex OAuth load/refresh + API key fallback |
 | `realtime-client.ts` | Default GA Realtime WebSocket client (+ `pi_turn` session / tool events) |
 | `backends/index.ts` | Environment-selected `RealtimeClientLike` factory |
-| `backends/codex-app-server.ts` | Experimental Codex app-server realtime V3 stdio adapter |
+| `backends/codex-app-server.ts` | Experimental Codex app-server realtime adapter (V2 text / V3 audio) |
 | `capture.ts` | mic → PCM16 mono via sox/rec |
 | `bridge.ts` | final text → `pi.sendUserMessage` (idle / steer) |
 | `playback.ts` | TTS speak-back (`say` / OpenAI / off) |

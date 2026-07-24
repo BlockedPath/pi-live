@@ -3,8 +3,8 @@
  *
  * The default backend is the pi-native OpenAI Realtime WebSocket client
  * (`PI_VOICE_BACKEND=openai`). Setting `PI_VOICE_BACKEND=codex` swaps in the
- * optional Codex app-server realtime V3 adapter, which drives the local
- * `codex` CLI and maps `thread/realtime/*` events into the same
+ * optional Codex app-server realtime adapter (V2 text / V3 audio), which drives
+ * the local `codex` CLI and maps `thread/realtime/*` events into the same
  * `RealtimeClientLike` surface the session already consumes.
  *
  * Both backends implement {@link RealtimeClientLike}, so the rest of the

@@ -10,13 +10,15 @@
  * ── Protocol research summary (Codex CLI 0.145.0) ─────────────────────────
  * `codex app-server` speaks JSON-RPC 2.0 over stdio (newline-delimited JSON;
  * the `"jsonrpc":"2.0"` header is OMITTED on the wire per the app-server README).
- * Realtime V3 is EXPERIMENTAL and lives behind `thread/realtime/*`:
+ * Realtime is EXPERIMENTAL and lives behind `thread/realtime/*`:
  *
- *   initialize                       → {clientInfo:{name,title,version}}
+ *   initialize                       → {clientInfo:{name,title,version},
+ *                                      capabilities:{experimentalApi:true}}
  *   initialized                      (notification, no id)
  *   thread/start                     → {} → response {thread:{id,...}}
  *   thread/realtime/start            → {threadId, outputModality:"text"|"audio",
- *                                      version?:"v3", voice?, model?, transport?}
+ *                                      version:"v2" (text) | "v3" (audio),
+ *                                      voice?, model?, transport?}
  *                                    → {} (then thread/realtime/started notification)
  *   thread/realtime/appendAudio      → {threadId, audio:{data:b64, sampleRate, numChannels}}
  *   thread/realtime/appendText      → {threadId, text, role}
@@ -309,16 +311,20 @@ export interface CodexAppServerBackendOptions {
 	spawn?: CodexSpawnFn;
 	/** Skip the `codex --version` precheck (tests with injected transport). */
 	skipDetect?: boolean;
-	/** Realtime protocol version (default `v3`). */
+	/**
+	 * Explicit protocol override. Default is mode-aware: V2 for text/transcription
+	 * and V3 for audio/conversational, matching Codex CLI 0.145 constraints.
+	 */
 	version?: "v1" | "v2" | "v3";
 }
 
 /**
- * Adapter that drives `codex app-server` realtime V3 and presents the same
- * `RealtimeClientLike` surface as the OpenAI Realtime WebSocket client.
+ * Adapter that drives experimental `codex app-server` realtime (V2 text / V3
+ * audio) and presents the same `RealtimeClientLike` surface as the OpenAI
+ * Realtime WebSocket client.
  */
 export class CodexAppServerBackend implements RealtimeClientLike {
-	readonly #version: "v1" | "v2" | "v3";
+	readonly #version?: "v1" | "v2" | "v3";
 	readonly #codexBin: string;
 	readonly #env: NodeJS.ProcessEnv;
 	readonly #spawn?: CodexSpawnFn;
@@ -337,7 +343,7 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 	#userSpeaking = false;
 
 	constructor(options: CodexAppServerBackendOptions = {}) {
-		this.#version = options.version ?? "v3";
+		this.#version = options.version;
 		this.#codexBin = options.codexBin ?? DEFAULT_CODEX_BIN;
 		this.#env = options.env ?? process.env;
 		this.#spawn = options.spawn;
@@ -351,7 +357,7 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 	}
 
 	async connect(
-		_authHeaders: Record<string, string>,
+		authHeaders: Record<string, string>,
 		config: unknown,
 	): Promise<void> {
 		if (this.#connected) return;
@@ -379,8 +385,11 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 			}
 		}
 
-		// 2. Open the transport.
-		const transport = this.#injectedTransport ?? this.#spawnTransport();
+		// 2. Open the transport. API-key credentials resolved by pi (including
+		// PI_VOICE_API_KEY) are forwarded only to the child environment.
+		const transport =
+			this.#injectedTransport ??
+			this.#spawnTransport(this.#appServerEnv(authHeaders));
 		this.#transport = transport;
 		transport.onLine((line) => this.#handleLine(line));
 		transport.onError((err) => this.#handleTransportError(err));
@@ -394,6 +403,8 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 					title: "pi-live voice extension",
 					version: "0.1.0",
 				},
+				// `thread/realtime/*` is gated by this negotiated capability.
+				capabilities: { experimentalApi: true },
 			});
 			this.#notify("initialized", {});
 			const startRes = (await this.#request("thread/start", {})) as {
@@ -408,12 +419,15 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 			}
 			this.#threadId = threadId;
 
-			// 4. Start the realtime session (V3).
+			// 4. Start realtime. Codex 0.145 requires V2 for text output; V3 is
+			// used for full-duplex audio. An explicit test/compat override wins.
 			const outputModality = cfg.mode === "conversational" ? "audio" : "text";
+			const version =
+				this.#version ?? (outputModality === "text" ? "v2" : "v3");
 			const realtimeParams: Record<string, unknown> = {
 				threadId,
 				outputModality,
-				version: this.#version,
+				version,
 			};
 			if (cfg.model) realtimeParams.model = cfg.model;
 			if (cfg.voice) realtimeParams.voice = cfg.voice;
@@ -421,8 +435,13 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 			// Subscribe before sending: app-server can return the response and
 			// started notification in the same stdout batch.
 			const started = this.#waitForStarted();
-			await this.#request("thread/realtime/start", realtimeParams);
-			await started;
+			// Observe both promises together. If the request fails, teardown closes
+			// the transport and rejects `started`; Promise.all keeps that secondary
+			// rejection handled instead of escalating as an uncaughtException.
+			await Promise.all([
+				this.#request("thread/realtime/start", realtimeParams),
+				started,
+			]);
 			this.#connected = true;
 		} catch (err) {
 			this.#teardownTransport();
@@ -434,12 +453,26 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 		}
 	}
 
-	#spawnTransport(): CodexTransport {
+	#appServerEnv(authHeaders: Record<string, string>): NodeJS.ProcessEnv {
+		const entries = Object.entries(authHeaders);
+		const chatgptAuth = entries.some(
+			([key]) => key.toLowerCase() === "chatgpt-account-id",
+		);
+		if (chatgptAuth) return this.#env;
+
+		const authorization = entries.find(
+			([key]) => key.toLowerCase() === "authorization",
+		)?.[1];
+		const token = authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+		return token ? { ...this.#env, OPENAI_API_KEY: token } : this.#env;
+	}
+
+	#spawnTransport(env: NodeJS.ProcessEnv): CodexTransport {
 		if (!this.#spawn) {
 			// Production default — real child_process.spawn.
-			return new StdioCodexTransport(spawn, this.#codexBin, this.#env);
+			return new StdioCodexTransport(spawn, this.#codexBin, env);
 		}
-		return new StdioCodexTransport(this.#spawn, this.#codexBin, this.#env);
+		return new StdioCodexTransport(this.#spawn, this.#codexBin, env);
 	}
 
 	#teardownTransport(): void {
