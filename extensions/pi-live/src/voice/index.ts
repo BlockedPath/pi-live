@@ -2,7 +2,7 @@
  * Public barrel for the pi-live voice module.
  *
  * Stable export surface for parallel slices #8–#11 and integration #12.
- * Implementations are added by those slices; VS0 ships types + config + idle stub.
+ * Implementations land per-slice; VS0 ships types + config + idle stub; VS1 adds auth.
  */
 
 export {
@@ -18,6 +18,11 @@ export {
 	type DeliverVoiceTextCallOptions,
 	type VoiceBridgePi,
 } from "./bridge.js";
+
+export {
+	VoiceAuthError,
+	resolveVoiceAuth,
+} from "./auth.js";
 
 export {
 	getSharedVoiceSession,

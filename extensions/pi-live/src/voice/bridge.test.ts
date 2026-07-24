@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { deliverVoiceText, type VoiceBridgePi } from "./bridge.js";
+import { deliverVoiceText, type VoiceBridgePi } from "./bridge.ts";
 
 type SendCall = {
 	text: string;
