@@ -140,6 +140,13 @@ const RECONNECT_BASE_DELAY_MS = 700;
 const SESSION_LIMIT_REFRESH_MS = 55 * 60 * 1000;
 /** Max wait for pi agent_settled while handling a pi_turn tool call. */
 const PI_TURN_TIMEOUT_MS = 180_000;
+/**
+ * Min mic level (0–1) to treat speech_started as a real barge-in while the
+ * assistant is talking. Below this is almost always speaker echo.
+ */
+const BARGE_IN_LEVEL = 0.08;
+/** Ignore speech_started this long after assistant audio begins (echo settle). */
+const BARGE_IN_GRACE_MS = 400;
 
 function errorMessage(err: unknown): string {
 	if (err instanceof VoiceAuthError) return err.message;
@@ -233,6 +240,8 @@ export class VoiceSession {
 	#responseActive = false;
 	/** Latest assistant item id for truncate on barge-in. */
 	#assistantItemId: string | undefined;
+	/** Date.now() when assistant audio last started (echo grace). */
+	#assistantAudioAt = 0;
 
 	readonly #stateHandlers = new Set<StateChangeHandler>();
 	readonly #transcriptHandlers = new Set<TranscriptHandler>();
@@ -854,16 +863,29 @@ export class VoiceSession {
 			const event = args[0] as TranscriptEvent | undefined;
 			if (!event) return;
 			if (event.type === "speech_started") {
-				// Barge-in FIRST: kill speaker audio before anything else.
+				// Echo-resistant barge-in: while the assistant is talking, ignore
+				// low-level VAD (almost always speaker bleed into the mic).
+				const assistantHot =
+					this.#responseActive ||
+					this.#pcmOut.isSpeaking() ||
+					this.#pcmOut.hasAudio();
+				if (assistantHot) {
+					const inGrace =
+						Date.now() - this.#assistantAudioAt < BARGE_IN_GRACE_MS;
+					const loudEnough = this.#audioLevel >= BARGE_IN_LEVEL;
+					if (inGrace || !loudEnough) {
+						// Likely echo — do not cut the assistant mid-sentence.
+						return;
+					}
+				}
+				// Real user barge-in: kill speaker audio first.
 				this.#bargeIn(client);
-				// Mark hearing before stop() so echo-guard resumes immediately.
 				this.#hearing = true;
 				this.#partial = "";
 				this.#clearEchoGuardTimer();
 				if (!this.#agentBusy && this.#state === "listening") {
 					this.setCapturePaused(false);
 				}
-				// Avoid spamming notify on every VAD blip while talking over assistant.
 			} else if (event.type === "speech_stopped") {
 				this.#hearing = false;
 				// Keep partial until final arrives.
@@ -919,9 +941,22 @@ export class VoiceSession {
 			if (this.#config.mode !== "conversational") return;
 			const event = args[0] as RealtimeAudioDeltaEvent | undefined;
 			if (!event?.delta) return;
+			const firstChunk = !this.#pcmOut.hasAudio();
 			this.#responseActive = true;
 			if (event.itemId) this.#assistantItemId = event.itemId;
-			// Stream immediately — do not wait for audio.done (needed for barge-in).
+			if (firstChunk) {
+				this.#assistantAudioAt = Date.now();
+				// Drop any residual mic audio already in the server buffer so
+				// speaker echo cannot look like a new user turn.
+				try {
+					(
+						client as { clearAudio?: () => void }
+					).clearAudio?.();
+				} catch {
+					// optional on fakes
+				}
+				this.setCapturePaused(true);
+			}
 			this.#pcmOut.appendBase64(event.delta, event.itemId);
 			this.#pushUiStatus();
 			this.#pushPartialWidget();
@@ -1474,6 +1509,7 @@ export class VoiceSession {
 		this.#lastFinalAt = 0;
 		this.#responseActive = false;
 		this.#assistantItemId = undefined;
+		this.#assistantAudioAt = 0;
 		this.#audioChunks = 0;
 		this.#audioLevel = 0;
 		this.#lastLevelUiAt = 0;

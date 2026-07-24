@@ -310,9 +310,12 @@ export function buildDefaultSessionConfig(
 				...base.audio?.input,
 				turn_detection: {
 					type: "server_vad",
-					// Automatically answer after user speech + allow barge-in cancel.
+					// Auto-answer after user speech.
+					// interrupt_response=false: speaker echo must NOT cancel the
+					// model mid-sentence; client barge-in handles real interrupts.
 					create_response: true,
-					interrupt_response: true,
+					interrupt_response: false,
+					silence_duration_ms: 600,
 				},
 			},
 		};

@@ -469,76 +469,65 @@ export class VoicePlayback {
 
 
 /**
- * Stream PCM16 mono realtime audio out (VS8 conversational).
+ * Realtime assistant PCM playback (VS8 conversational).
  *
- * Uses a short jitter buffer before starting sox `play`, then streams with
- * backpressure-aware queuing so audio does not underrun/glitch. `stop()`
- * still kills playback immediately for barge-in; stdin EPIPE is swallowed.
+ * Buffers PCM16 deltas for the current assistant item, then plays a WAV via
+ * `afplay`/`ffplay` so sentences complete without sox underrun glitches.
+ * `stop()` aborts immediately (discards buffer / kills player) for barge-in.
+ * Speaker-echo barge-in is filtered in session.ts — this class just plays/stops.
  */
 export interface PcmStreamPlayerOptions {
 	sampleRate?: number;
 	spawn?: SpawnFn;
-	/** Streaming player binary (default: `play` from sox). */
-	command?: string;
-	/**
-	 * Ms of PCM to buffer before starting the player (smooth start).
-	 * Default ~80ms — low enough for duplex, high enough to avoid underruns.
-	 */
-	prebufferMs?: number;
 }
 
-/** Default pre-roll before opening the speaker (~80ms @ 24k mono PCM16). */
-const DEFAULT_PREBUFFER_MS = 80;
-/** Soft cap on queued PCM after the player starts (~1s). */
-const MAX_QUEUE_BYTES = 24_000 * 2 * 1;
+function writeWavPcm16Mono(pcm: Buffer, sampleRate: number): Buffer {
+	const dataSize = pcm.byteLength;
+	const header = Buffer.alloc(44);
+	header.write("RIFF", 0);
+	header.writeUInt32LE(36 + dataSize, 4);
+	header.write("WAVE", 8);
+	header.write("fmt ", 12);
+	header.writeUInt32LE(16, 16);
+	header.writeUInt16LE(1, 20);
+	header.writeUInt16LE(1, 22);
+	header.writeUInt32LE(sampleRate, 24);
+	header.writeUInt32LE(sampleRate * 2, 28);
+	header.writeUInt16LE(2, 32);
+	header.writeUInt16LE(16, 34);
+	header.write("data", 36);
+	header.writeUInt32LE(dataSize, 40);
+	return Buffer.concat([header, pcm]);
+}
 
 export class PcmStreamPlayer {
 	readonly #sampleRate: number;
 	readonly #spawn: SpawnFn;
-	readonly #command: string;
-	readonly #prebufferBytes: number;
 	readonly #handlers = new Set<SpeakingHandler>();
 
 	#child: ChildProcess | undefined;
-	#stdinFailed = false;
+	#chunks: Buffer[] = [];
 	#bytesWritten = 0;
 	#itemId: string | undefined;
 	#speaking = false;
 	#generation = 0;
 	#hasAudio = false;
-
-	/** Pre-start jitter buffer. */
-	#prebuffer: Buffer[] = [];
-	#prebufferSize = 0;
-	/** Post-start queue for backpressure. */
-	#queue: Buffer[] = [];
-	#queueSize = 0;
-	#draining = false;
-	#started = false;
-	#ending = false;
+	#playFile: string | undefined;
+	#playing = false;
 
 	constructor(options: PcmStreamPlayerOptions = {}) {
 		this.#sampleRate = options.sampleRate ?? 24_000;
 		this.#spawn = options.spawn ?? defaultSpawn;
-		this.#command = options.command ?? "play";
-		const ms = options.prebufferMs ?? DEFAULT_PREBUFFER_MS;
-		// PCM16 mono: 2 bytes/sample
-		this.#prebufferBytes = Math.max(
-			1024,
-			Math.floor((this.#sampleRate * 2 * ms) / 1000),
-		);
 	}
 
 	isSpeaking(): boolean {
-		return this.#speaking;
+		return this.#speaking || this.#playing;
 	}
 
-	/** True if this turn received any assistant audio (playing or buffered). */
 	hasAudio(): boolean {
-		return this.#hasAudio || this.#speaking || Boolean(this.#itemId);
+		return this.#hasAudio || this.#speaking || this.#playing || Boolean(this.#itemId);
 	}
 
-	/** Milliseconds of PCM accepted so far for the current item. */
 	getPlayedMs(): number {
 		const samples = Math.floor(this.#bytesWritten / 2);
 		return Math.floor((samples * 1000) / this.#sampleRate);
@@ -555,9 +544,7 @@ export class PcmStreamPlayer {
 		};
 	}
 
-	/**
-	 * Append a base64 PCM16 chunk. Prefills a jitter buffer, then streams.
-	 */
+	/** Accept a base64 PCM16 chunk for the current assistant item. */
 	appendBase64(delta: string, itemId?: string): void {
 		if (!delta) return;
 		let buf: Buffer;
@@ -569,281 +556,132 @@ export class PcmStreamPlayer {
 		if (buf.byteLength === 0) return;
 
 		if (itemId && this.#itemId && itemId !== this.#itemId) {
+			// New item — finish/stop prior playback first.
 			this.stop();
 		}
 		if (itemId) this.#itemId = itemId;
 
 		this.#hasAudio = true;
+		this.#chunks.push(buf);
 		this.#bytesWritten += buf.byteLength;
-		// Mark speaking as soon as audio is arriving (UI + barge-in).
+		// "Speaking" from first chunk so capture pauses / UI updates even
+		// while we buffer toward a clean full-utterance play.
 		this.#setSpeaking(true);
+	}
 
-		if (!this.#started) {
-			this.#prebuffer.push(buf);
-			this.#prebufferSize += buf.byteLength;
-			if (this.#prebufferSize >= this.#prebufferBytes) {
-				this.#startPlayer();
-			}
+	/** Server finished this audio segment — play the buffered PCM cleanly. */
+	done(): void {
+		const gen = this.#generation;
+		const pcm = Buffer.concat(this.#chunks);
+		this.#chunks = [];
+		if (pcm.byteLength < 4) {
+			this.#setSpeaking(false);
 			return;
 		}
-
-		this.#enqueue(buf);
-		this.#pump();
+		void this.#playWav(pcm, gen);
 	}
 
 	/**
-	 * End-of-audio from the server. Flushes prebuffer if still priming, then
-	 * ends stdin after the queue drains.
-	 */
-	done(): void {
-		this.#ending = true;
-		if (!this.#started) {
-			// Short utterance shorter than prebuffer — play what we have.
-			if (this.#prebufferSize > 0) {
-				this.#startPlayer();
-			} else {
-				this.#setSpeaking(false);
-			}
-		}
-		this.#pump();
-		this.#maybeEndStdin();
-	}
-
-	/**
-	 * Stop playback immediately (barge-in).
-	 * @returns item id + audio_end_ms for conversation.item.truncate
+	 * Abort immediately (barge-in). Drops undelivered PCM and kills player.
 	 */
 	stop(): { itemId?: string; audioEndMs: number } {
 		const itemId = this.#itemId;
 		const audioEndMs = this.getPlayedMs();
 		this.#generation++;
 		const child = this.#child;
+		const file = this.#playFile;
 		this.#child = undefined;
-		this.#stdinFailed = true;
+		this.#playFile = undefined;
+		this.#chunks = [];
 		this.#bytesWritten = 0;
 		this.#itemId = undefined;
 		this.#hasAudio = false;
-		this.#prebuffer = [];
-		this.#prebufferSize = 0;
-		this.#queue = [];
-		this.#queueSize = 0;
-		this.#draining = false;
-		this.#started = false;
-		this.#ending = false;
+		this.#playing = false;
 
 		if (child) {
-			this.#teardownChild(child);
+			try {
+				const stdin = child.stdin;
+				if (stdin && !stdin.destroyed) {
+					stdin.removeAllListeners("error");
+					stdin.on("error", () => undefined);
+					try {
+						stdin.destroy();
+					} catch {
+						// ignore
+					}
+				}
+			} catch {
+				// ignore
+			}
+			try {
+				if (!child.killed) child.kill("SIGKILL");
+			} catch {
+				// ignore
+			}
+			try {
+				child.removeAllListeners();
+			} catch {
+				// ignore
+			}
+		}
+		if (file) {
+			void unlink(file).catch(() => undefined);
 		}
 		this.#setSpeaking(false);
 		return { itemId, audioEndMs };
 	}
 
-	#startPlayer(): void {
-		if (this.#started) return;
-		this.#started = true;
-		this.#ensureChild();
+	async #playWav(pcm: Buffer, gen: number): Promise<void> {
+		if (gen !== this.#generation) return;
 
-		// Flush prebuffer as one contiguous write when possible.
-		if (this.#prebufferSize > 0) {
-			const primed = Buffer.concat(this.#prebuffer, this.#prebufferSize);
-			this.#prebuffer = [];
-			this.#prebufferSize = 0;
-			this.#enqueue(primed);
+		const wav = writeWavPcm16Mono(pcm, this.#sampleRate);
+		const file = join(
+			tmpdir(),
+			`pi-voice-rt-${randomBytes(8).toString("hex")}.wav`,
+		);
+		try {
+			await writeFile(file, wav);
+		} catch {
+			if (gen === this.#generation) this.#setSpeaking(false);
+			return;
 		}
-		this.#pump();
-		if (this.#ending) this.#maybeEndStdin();
-	}
-
-	#enqueue(buf: Buffer): void {
-		// Drop from the head if the queue grows too large (network burst /
-		// slow speaker) — prefer staying near-live over perfect fidelity.
-		this.#queue.push(buf);
-		this.#queueSize += buf.byteLength;
-		while (this.#queueSize > MAX_QUEUE_BYTES && this.#queue.length > 1) {
-			const dropped = this.#queue.shift();
-			if (dropped) this.#queueSize -= dropped.byteLength;
-		}
-	}
-
-	#pump(): void {
-		if (this.#draining || this.#stdinFailed || !this.#started) return;
-		const child = this.#child;
-		const stdin = child?.stdin;
-		if (!stdin || stdin.destroyed || !stdin.writable) {
-			this.#stdinFailed = true;
+		if (gen !== this.#generation) {
+			await unlink(file).catch(() => undefined);
 			return;
 		}
 
-		this.#draining = true;
+		const player = platform() === "darwin" ? "afplay" : "ffplay";
+		const args =
+			player === "afplay"
+				? [file]
+				: ["-nodisp", "-autoexit", "-loglevel", "quiet", file];
+
 		try {
-			while (this.#queue.length > 0) {
-				const next = this.#queue[0]!;
-				let ok = false;
-				try {
-					ok = stdin.write(next, (err) => {
-						if (!err) return;
-						if (
-							(err as NodeJS.ErrnoException).code === "EPIPE" ||
-							(err as NodeJS.ErrnoException).code === "ERR_STREAM_DESTROYED"
-						) {
-							this.#stdinFailed = true;
-							return;
-						}
-						this.#stdinFailed = true;
-					});
-				} catch (err) {
-					const code =
-						err && typeof err === "object" && "code" in err
-							? String((err as { code?: unknown }).code)
-							: "";
-					if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") {
-						this.#stdinFailed = true;
-					} else {
-						this.#stdinFailed = true;
-					}
-					break;
-				}
-
-				this.#queue.shift();
-				this.#queueSize -= next.byteLength;
-				if (this.#queueSize < 0) this.#queueSize = 0;
-
-				if (!ok) {
-					// Backpressure — resume on drain.
-					const onDrain = () => {
-						stdin.off("drain", onDrain);
-						this.#draining = false;
-						if (!this.#stdinFailed) {
-							this.#pump();
-							this.#maybeEndStdin();
-						}
-					};
-					stdin.once("drain", onDrain);
-					return;
-				}
-			}
-		} finally {
-			// Only clear draining if we are not waiting on drain.
-			if (!this.#stdinFailed) {
-				const waiting =
-					this.#queue.length > 0 &&
-					stdin &&
-					!stdin.destroyed &&
-					stdin.listenerCount("drain") > 0;
-				if (!waiting) this.#draining = false;
-			} else {
-				this.#draining = false;
-			}
-		}
-
-		this.#maybeEndStdin();
-	}
-
-	#maybeEndStdin(): void {
-		if (!this.#ending || this.#queue.length > 0 || this.#stdinFailed) return;
-		const stdin = this.#child?.stdin;
-		if (!stdin || stdin.destroyed) return;
-		try {
-			stdin.end();
-		} catch {
-			this.#stdinFailed = true;
-		}
-	}
-
-	#ensureChild(): void {
-		if (this.#child && !this.#child.killed && !this.#stdinFailed) return;
-		if (this.#child) {
-			this.#teardownChild(this.#child);
-			this.#child = undefined;
-		}
-
-		const gen = this.#generation;
-		try {
-			const child = this.#spawn(
-				this.#command,
-				[
-					"-q",
-					"-t",
-					"raw",
-					"-r",
-					String(this.#sampleRate),
-					"-e",
-					"signed-integer",
-					"-b",
-					"16",
-					"-c",
-					"1",
-					// Larger play buffer reduces underrun clicks.
-					"--buffer",
-					"1024",
-					"-",
-				],
-				{
-					stdio: ["pipe", "ignore", "ignore"],
-					env: process.env,
-				},
-			);
+			const child = this.#spawn(player, args, {
+				stdio: "ignore",
+				env: process.env,
+			});
 			this.#child = child;
-			this.#stdinFailed = false;
+			this.#playFile = file;
+			this.#playing = true;
+			this.#setSpeaking(true);
 
-			const stdin = child.stdin;
-			if (stdin) {
-				// Prevent uncaughtException on EPIPE after kill/exit.
-				stdin.on("error", (err: NodeJS.ErrnoException) => {
-					if (
-						err?.code === "EPIPE" ||
-						err?.code === "ERR_STREAM_DESTROYED"
-					) {
-						this.#stdinFailed = true;
-						return;
-					}
-					this.#stdinFailed = true;
-				});
-			}
-
-			child.on("error", () => {
-				if (gen !== this.#generation) return;
-				this.#stdinFailed = true;
-				if (this.#child === child) this.#child = undefined;
-				this.#setSpeaking(false);
-			});
-			child.on("close", () => {
-				if (gen !== this.#generation) return;
-				this.#stdinFailed = true;
-				if (this.#child === child) this.#child = undefined;
-				this.#setSpeaking(false);
+			await new Promise<void>((resolve) => {
+				const finish = () => resolve();
+				child.on("error", finish);
+				child.on("close", finish);
 			});
 		} catch {
-			this.#child = undefined;
-			this.#stdinFailed = true;
-		}
-	}
-
-	#teardownChild(child: ChildProcess): void {
-		const stdin = child.stdin;
-		if (stdin) {
-			try {
-				stdin.removeAllListeners("error");
-				stdin.removeAllListeners("drain");
-				stdin.on("error", () => undefined);
-				if (!stdin.destroyed) {
-					stdin.destroy();
-				}
-			} catch {
-				// ignore
+			// player missing
+		} finally {
+			if (gen === this.#generation) {
+				this.#child = undefined;
+				this.#playFile = undefined;
+				this.#playing = false;
+				this.#hasAudio = false;
+				this.#setSpeaking(false);
 			}
-		}
-		try {
-			if (!child.killed) {
-				child.kill("SIGKILL");
-			}
-		} catch {
-			// ignore
-		}
-		try {
-			child.removeAllListeners();
-		} catch {
-			// ignore
+			await unlink(file).catch(() => undefined);
 		}
 	}
 
