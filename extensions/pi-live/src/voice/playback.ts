@@ -511,7 +511,10 @@ export class PcmStreamPlayer {
 	/** Retained only to fall back to afplay/ffplay if the streaming pipe breaks. */
 	#fallbackChunks: Buffer[] = [];
 	#pipeFailed = false;
+	/** Decoded duration received from the provider. */
 	#bytesWritten = 0;
+	/** Wall-clock start caps truncate offsets to audio the server could have emitted. */
+	#audioStartedAt = 0;
 	#itemId: string | undefined;
 	#speaking = false;
 	#generation = 0;
@@ -534,7 +537,12 @@ export class PcmStreamPlayer {
 
 	getPlayedMs(): number {
 		const samples = Math.floor(this.#bytesWritten / 2);
-		return Math.floor((samples * 1000) / this.#sampleRate);
+		const decodedMs = Math.floor((samples * 1000) / this.#sampleRate);
+		if (this.#audioStartedAt === 0) return 0;
+		// Realtime audio can arrive faster than the local device drains it. The
+		// server rejects a truncate offset beyond its actual audio content, so never
+		// use received PCM duration alone as the playback position.
+		return Math.min(decodedMs, Math.max(0, Date.now() - this.#audioStartedAt));
 	}
 
 	getCurrentItemId(): string | undefined {
@@ -564,6 +572,7 @@ export class PcmStreamPlayer {
 			this.stop();
 		}
 		if (itemId) this.#itemId = itemId;
+		if (!this.#hasAudio) this.#audioStartedAt = Date.now();
 		this.#hasAudio = true;
 		this.#bytesWritten += buf.byteLength;
 		this.#fallbackChunks.push(buf);
@@ -618,6 +627,7 @@ export class PcmStreamPlayer {
 		this.#fallbackChunks = [];
 		this.#pipeFailed = false;
 		this.#bytesWritten = 0;
+		this.#audioStartedAt = 0;
 		this.#itemId = undefined;
 		this.#hasAudio = false;
 		this.#playing = false;
@@ -698,6 +708,7 @@ export class PcmStreamPlayer {
 				return;
 			}
 			this.#hasAudio = false;
+			this.#audioStartedAt = 0;
 			this.#itemId = undefined;
 			this.#setSpeaking(false);
 		};
@@ -757,6 +768,7 @@ export class PcmStreamPlayer {
 				this.#child = undefined;
 				this.#playing = false;
 				this.#hasAudio = false;
+				this.#audioStartedAt = 0;
 				this.#itemId = undefined;
 				this.#setSpeaking(false);
 			}
