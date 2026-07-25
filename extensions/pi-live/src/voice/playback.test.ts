@@ -277,4 +277,23 @@ describe("PcmStreamPlayer", () => {
 		assert.deepEqual(Array.from(spawned[1]?.written[0] ?? []), [2, 2]);
 		player.stop();
 	});
+
+	it("handles an asynchronous SoX stdin EPIPE without crashing pi", () => {
+		const spawned: ReturnType<typeof streamChild>[] = [];
+		const player = new PcmStreamPlayer({
+			spawn: () => {
+				const next = streamChild();
+				spawned.push(next);
+				return next.child;
+			},
+		});
+		player.appendBase64(Buffer.from([1, 2]).toString("base64"));
+		assert.doesNotThrow(() => {
+			spawned[0]?.stdin.emit(
+				"error",
+				Object.assign(new Error("write EPIPE"), { code: "EPIPE" }),
+			);
+		});
+		assert.equal(player.isSpeaking(), false);
+	});
 });

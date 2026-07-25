@@ -667,6 +667,9 @@ export class PcmStreamPlayer {
 		};
 		child.on("error", finish);
 		child.on("close", finish);
+		// `stdin.write()` reports a broken child pipe asynchronously. Without this
+		// listener Node treats EPIPE as an uncaught exception and exits pi.
+		child.stdin?.on("error", finish);
 		for (const chunk of queued) this.#write(chunk);
 	}
 
