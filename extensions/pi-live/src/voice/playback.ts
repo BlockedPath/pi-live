@@ -471,33 +471,15 @@ export class VoicePlayback {
 /**
  * Realtime assistant PCM playback (VS8 conversational).
  *
- * Buffers PCM16 deltas for the current assistant item, then plays a WAV via
- * `afplay`/`ffplay` so sentences complete without sox underrun glitches.
- * `stop()` aborts immediately (discards buffer / kills player) for barge-in.
- * Speaker-echo barge-in is filtered in session.ts — this class just plays/stops.
+ * Streams PCM16 directly to SoX `play` rather than batching a whole response
+ * into a temporary WAV. Realtime WebRTC has no reliable response-complete event;
+ * waiting for a silence-based boundary adds an audible gap, and a new boundary
+ * could previously start another `afplay` process before the first had finished.
+ * `stop()` aborts immediately for barge-in.
  */
 export interface PcmStreamPlayerOptions {
 	sampleRate?: number;
 	spawn?: SpawnFn;
-}
-
-function writeWavPcm16Mono(pcm: Buffer, sampleRate: number): Buffer {
-	const dataSize = pcm.byteLength;
-	const header = Buffer.alloc(44);
-	header.write("RIFF", 0);
-	header.writeUInt32LE(36 + dataSize, 4);
-	header.write("WAVE", 8);
-	header.write("fmt ", 12);
-	header.writeUInt32LE(16, 16);
-	header.writeUInt16LE(1, 20);
-	header.writeUInt16LE(1, 22);
-	header.writeUInt32LE(sampleRate, 24);
-	header.writeUInt32LE(sampleRate * 2, 28);
-	header.writeUInt16LE(2, 32);
-	header.writeUInt16LE(16, 34);
-	header.write("data", 36);
-	header.writeUInt32LE(dataSize, 40);
-	return Buffer.concat([header, pcm]);
 }
 
 export class PcmStreamPlayer {
@@ -506,14 +488,15 @@ export class PcmStreamPlayer {
 	readonly #handlers = new Set<SpeakingHandler>();
 
 	#child: ChildProcess | undefined;
-	#chunks: Buffer[] = [];
+	/** PCM received while the previous stream is draining after `done()`. */
+	#queued: Buffer[] = [];
 	#bytesWritten = 0;
 	#itemId: string | undefined;
 	#speaking = false;
 	#generation = 0;
 	#hasAudio = false;
-	#playFile: string | undefined;
 	#playing = false;
+	#streamEnding = false;
 
 	constructor(options: PcmStreamPlayerOptions = {}) {
 		this.#sampleRate = options.sampleRate ?? 24_000;
@@ -525,7 +508,7 @@ export class PcmStreamPlayer {
 	}
 
 	hasAudio(): boolean {
-		return this.#hasAudio || this.#speaking || this.#playing || Boolean(this.#itemId);
+		return this.#hasAudio || this.#speaking || this.#playing;
 	}
 
 	getPlayedMs(): number {
@@ -544,7 +527,7 @@ export class PcmStreamPlayer {
 		};
 	}
 
-	/** Accept a base64 PCM16 chunk for the current assistant item. */
+	/** Accept and immediately stream a base64 PCM16 chunk. */
 	appendBase64(delta: string, itemId?: string): void {
 		if (!delta) return;
 		let buf: Buffer;
@@ -556,47 +539,53 @@ export class PcmStreamPlayer {
 		if (buf.byteLength === 0) return;
 
 		if (itemId && this.#itemId && itemId !== this.#itemId) {
-			// New item — finish/stop prior playback first.
+			// A server item boundary supersedes any previous playback immediately.
 			this.stop();
 		}
 		if (itemId) this.#itemId = itemId;
-
 		this.#hasAudio = true;
-		this.#chunks.push(buf);
 		this.#bytesWritten += buf.byteLength;
-		// "Speaking" from first chunk so capture pauses / UI updates even
-		// while we buffer toward a clean full-utterance play.
 		this.#setSpeaking(true);
-	}
 
-	/** Server finished this audio segment — play the buffered PCM cleanly. */
-	done(): void {
-		const gen = this.#generation;
-		const pcm = Buffer.concat(this.#chunks);
-		this.#chunks = [];
-		if (pcm.byteLength < 4) {
-			this.#setSpeaking(false);
+		if (this.#child && !this.#streamEnding) {
+			this.#write(buf);
 			return;
 		}
-		void this.#playWav(pcm, gen);
+
+		this.#queued.push(buf);
+		if (!this.#child) this.#startStream(this.#generation);
 	}
 
 	/**
-	 * Abort immediately (barge-in). Drops undelivered PCM and kills player.
+	 * The server finished an audio segment. End stdin so SoX drains its buffered
+	 * PCM. Chunks for a later segment are queued until that process exits, which
+	 * prevents two system players from overlapping.
 	 */
+	done(): void {
+		const child = this.#child;
+		if (!child || this.#streamEnding) return;
+		this.#streamEnding = true;
+		try {
+			const stdin = child.stdin;
+			if (stdin && !stdin.destroyed && stdin.writable) stdin.end();
+		} catch {
+			// The close handler below will clean up a failed player.
+		}
+	}
+
+	/** Abort immediately (barge-in). Drops queued PCM and kills SoX. */
 	stop(): { itemId?: string; audioEndMs: number } {
 		const itemId = this.#itemId;
 		const audioEndMs = this.getPlayedMs();
 		this.#generation++;
 		const child = this.#child;
-		const file = this.#playFile;
 		this.#child = undefined;
-		this.#playFile = undefined;
-		this.#chunks = [];
+		this.#queued = [];
 		this.#bytesWritten = 0;
 		this.#itemId = undefined;
 		this.#hasAudio = false;
 		this.#playing = false;
+		this.#streamEnding = false;
 
 		if (child) {
 			try {
@@ -604,11 +593,7 @@ export class PcmStreamPlayer {
 				if (stdin && !stdin.destroyed) {
 					stdin.removeAllListeners("error");
 					stdin.on("error", () => undefined);
-					try {
-						stdin.destroy();
-					} catch {
-						// ignore
-					}
+					stdin.destroy();
 				}
 			} catch {
 				// ignore
@@ -624,64 +609,78 @@ export class PcmStreamPlayer {
 				// ignore
 			}
 		}
-		if (file) {
-			void unlink(file).catch(() => undefined);
-		}
 		this.#setSpeaking(false);
 		return { itemId, audioEndMs };
 	}
 
-	async #playWav(pcm: Buffer, gen: number): Promise<void> {
-		if (gen !== this.#generation) return;
-
-		const wav = writeWavPcm16Mono(pcm, this.#sampleRate);
-		const file = join(
-			tmpdir(),
-			`pi-voice-rt-${randomBytes(8).toString("hex")}.wav`,
-		);
-		try {
-			await writeFile(file, wav);
-		} catch {
-			if (gen === this.#generation) this.#setSpeaking(false);
+	#startStream(gen: number): void {
+		if (gen !== this.#generation || this.#child || this.#queued.length === 0) {
 			return;
 		}
-		if (gen !== this.#generation) {
-			await unlink(file).catch(() => undefined);
+		const queued = this.#queued;
+		this.#queued = [];
+		let child: ChildProcess;
+		try {
+			child = this.#spawn(
+				"play",
+				[
+					"-q",
+					"-t",
+					"raw",
+					"-r",
+					String(this.#sampleRate),
+					"-e",
+					"signed-integer",
+					"-b",
+					"16",
+					"-c",
+					"1",
+					"-",
+				],
+				{ stdio: ["pipe", "ignore", "ignore"], env: process.env },
+			);
+		} catch {
+			this.#hasAudio = false;
+			this.#itemId = undefined;
+			this.#setSpeaking(false);
 			return;
 		}
 
-		const player = platform() === "darwin" ? "afplay" : "ffplay";
-		const args =
-			player === "afplay"
-				? [file]
-				: ["-nodisp", "-autoexit", "-loglevel", "quiet", file];
-
-		try {
-			const child = this.#spawn(player, args, {
-				stdio: "ignore",
-				env: process.env,
-			});
-			this.#child = child;
-			this.#playFile = file;
-			this.#playing = true;
-			this.#setSpeaking(true);
-
-			await new Promise<void>((resolve) => {
-				const finish = () => resolve();
-				child.on("error", finish);
-				child.on("close", finish);
-			});
-		} catch {
-			// player missing
-		} finally {
-			if (gen === this.#generation) {
-				this.#child = undefined;
-				this.#playFile = undefined;
-				this.#playing = false;
-				this.#hasAudio = false;
-				this.#setSpeaking(false);
+		this.#child = child;
+		this.#playing = true;
+		this.#streamEnding = false;
+		let finished = false;
+		const finish = () => {
+			if (finished) return;
+			finished = true;
+			if (gen !== this.#generation || this.#child !== child) return;
+			this.#child = undefined;
+			this.#playing = false;
+			this.#streamEnding = false;
+			if (this.#queued.length > 0) {
+				this.#startStream(gen);
+				return;
 			}
-			await unlink(file).catch(() => undefined);
+			this.#hasAudio = false;
+			this.#itemId = undefined;
+			this.#setSpeaking(false);
+		};
+		child.on("error", finish);
+		child.on("close", finish);
+		for (const chunk of queued) this.#write(chunk);
+	}
+
+	#write(chunk: Buffer): void {
+		const stdin = this.#child?.stdin;
+		if (!stdin || stdin.destroyed || !stdin.writable || this.#streamEnding) {
+			this.#queued.push(chunk);
+			return;
+		}
+		try {
+			stdin.write(chunk);
+		} catch {
+			// A broken local player must not tear down the realtime session.
+			this.#queued.push(chunk);
 		}
 	}
 

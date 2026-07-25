@@ -89,12 +89,12 @@
  *      spawned app-server's CLI config. It is still forwarded over WebSocket.
  *  G9. The WebRTC remote track emits a CONTINUOUS 10 ms frame stream for the
  *      whole session, including digital silence between utterances (verified:
- *      a sender that stops feeding entirely still yields frames, RMS 0). Those
- *      frames must NOT be forwarded as `audio.delta`, or `PcmStreamPlayer` stays
- *      permanently "speaking" and the session holds mic capture paused for echo
- *      suppression — the mic never reopens after the first reply. `codex-webrtc`
- *      gates on frame RMS and reports an `onAudioIdle` silence gap, which we map
- *      to `audio.done` since the transport has no end-of-utterance event.
+ *      a sender that stops feeding entirely still yields frames, RMS 0). Idle
+ *      silence is gated so it cannot keep `PcmStreamPlayer` permanently
+ *      "speaking" and hold mic capture paused. Silence within an active
+ *      utterance is retained to preserve natural speech pauses. `codex-webrtc`
+ *      reports an `onAudioIdle` silence gap, which we map to `audio.done` since
+ *      the transport has no end-of-utterance event.
  *
  * Unit tests inject a fake `CodexTransport` — no real `codex` process and no
  * network are required.

@@ -6,6 +6,7 @@
  */
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { describe, it } from "node:test";
 import type { ChildProcess } from "node:child_process";
 
@@ -15,6 +16,7 @@ import {
 	resolveTtsBackend,
 	speak,
 	summarizeForSpeech,
+	PcmStreamPlayer,
 	VoicePlayback,
 	type SpawnFn,
 } from "./playback.ts";
@@ -200,5 +202,79 @@ describe("speak / VoicePlayback", () => {
 		await playback.speak("Nope");
 		assert.equal(spawned, 0);
 		assert.equal(playback.isSpeaking(), false);
+	});
+});
+
+describe("PcmStreamPlayer", () => {
+	function streamChild() {
+		const child = new EventEmitter() as ChildProcess & EventEmitter;
+		const stdin = new PassThrough();
+		const written: Buffer[] = [];
+		stdin.on("data", (chunk: Buffer) => written.push(Buffer.from(chunk)));
+		child.stdin = stdin;
+		child.kill = ((_signal?: NodeJS.Signals | number) => {
+			queueMicrotask(() => child.emit("close", null, "SIGTERM"));
+			return true;
+		}) as ChildProcess["kill"];
+		return { child, stdin, written };
+	}
+
+	it("streams PCM immediately to one SoX process and closes stdin on done", () => {
+		const calls: Array<{ command: string; args: readonly string[] }> = [];
+		const spawned: ReturnType<typeof streamChild>[] = [];
+		const player = new PcmStreamPlayer({
+			spawn: (command, args) => {
+				calls.push({ command, args: [...args] });
+				const next = streamChild();
+				spawned.push(next);
+				return next.child;
+			},
+		});
+		const speaking: boolean[] = [];
+		player.onSpeakingChange((value) => speaking.push(value));
+		player.appendBase64(Buffer.from([1, 2, 3, 4]).toString("base64"));
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0]?.command, "play");
+		assert.deepEqual(calls[0]?.args, [
+			"-q",
+			"-t",
+			"raw",
+			"-r",
+			"24000",
+			"-e",
+			"signed-integer",
+			"-b",
+			"16",
+			"-c",
+			"1",
+			"-",
+		]);
+		assert.deepEqual(Array.from(spawned[0]?.written[0] ?? []), [1, 2, 3, 4]);
+		assert.equal(player.isSpeaking(), true);
+		player.done();
+		assert.equal(spawned[0]?.stdin.writableEnded, true);
+		spawned[0]?.child.emit("close", 0, null);
+		assert.equal(player.isSpeaking(), false);
+		assert.deepEqual(speaking, [true, false]);
+	});
+
+	it("queues a later segment until the prior SoX process closes", () => {
+		const spawned: ReturnType<typeof streamChild>[] = [];
+		const player = new PcmStreamPlayer({
+			spawn: () => {
+				const next = streamChild();
+				spawned.push(next);
+				return next.child;
+			},
+		});
+		player.appendBase64(Buffer.from([1, 1]).toString("base64"));
+		player.done();
+		player.done(); // Duplicate completion cannot launch another player.
+		player.appendBase64(Buffer.from([2, 2]).toString("base64"));
+		assert.equal(spawned.length, 1);
+		spawned[0]?.child.emit("close", 0, null);
+		assert.equal(spawned.length, 2, "next segment starts only after prior close");
+		assert.deepEqual(Array.from(spawned[1]?.written[0] ?? []), [2, 2]);
+		player.stop();
 	});
 });
