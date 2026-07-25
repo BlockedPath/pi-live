@@ -146,6 +146,9 @@ class FakeClient implements RealtimeClientLike {
 		this.#emit(kind === "started" ? "speech.started" : "speech.stopped", event);
 	}
 
+	emitError(error?: unknown): void {
+		this.#emit("error", error);
+	}
 	#emit(event: string, ...args: unknown[]): void {
 		const set = this.#listeners.get(event);
 		if (!set) return;
@@ -358,6 +361,14 @@ describe("VoiceSession", () => {
 		});
 	});
 
+	it("renders malformed realtime error events diagnostically", async () => {
+		const { session, client, uiLines } = makeSession();
+		await session.start({ pi: { sendUserMessage: () => undefined } });
+		client.emitError();
+		client.emitError({ code: "upstream_failure", details: "retry" });
+		assert.ok(uiLines.some((line) => /empty event/.test(line)));
+		assert.ok(uiLines.some((line) => /upstream_failure/.test(line)));
+	});
 	it("streams audio only when listening and not paused", async () => {
 		const { session, client, capture } = makeSession();
 		await session.start({
