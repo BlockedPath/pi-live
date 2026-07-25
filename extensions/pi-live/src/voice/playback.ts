@@ -577,6 +577,9 @@ export class PcmStreamPlayer {
 		this.#bytesWritten += buf.byteLength;
 		this.#fallbackChunks.push(buf);
 		this.#setSpeaking(true);
+		// An EPIPE means this utterance cannot safely resume on another streaming
+		// process: that would overlap the buffered afplay fallback at `done()`.
+		if (this.#pipeFailed) return;
 
 		if (this.#child && !this.#streamEnding) {
 			this.#write(buf);
@@ -718,6 +721,11 @@ export class PcmStreamPlayer {
 		// listener Node treats EPIPE as an uncaught exception and exits pi.
 		child.stdin?.on("error", () => {
 			this.#pipeFailed = true;
+			try {
+				if (!child.killed) child.kill("SIGKILL");
+			} catch {
+				// ignore — the broken pipe usually means it already exited.
+			}
 			finish();
 		});
 		for (const chunk of queued) this.#write(chunk);
@@ -732,7 +740,8 @@ export class PcmStreamPlayer {
 		try {
 			stdin.write(chunk);
 		} catch {
-			// A broken local player must not tear down the realtime session.
+			// A synchronous pipe failure follows the same one-player fallback path.
+			this.#pipeFailed = true;
 			this.#queued.push(chunk);
 		}
 	}
