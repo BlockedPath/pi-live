@@ -16,7 +16,7 @@
     ]
   },
   "dependencies": {
-    "@koush/wrtc": "^0.5.3",
+    "@roamhq/wrtc": "^0.10.0",
     "ws": "^8.18.3"
   },
   "devDependencies": {

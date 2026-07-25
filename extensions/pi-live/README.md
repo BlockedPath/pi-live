@@ -113,13 +113,9 @@ The Codex backend is strictly opt-in. Missing or invalid values fall back to `op
 
 The app-server rejects *all* WebSocket-transport realtime on a ChatGPT-OAuth account with `realtime conversation requires API key auth` — for both V2 text and V3 audio. Only the WebRTC transport authenticates over OAuth, and WebRTC is audio-only. So conversational mode works with just `codex login`, while transcription mode needs `OPENAI_API_KEY` (or `PI_VOICE_API_KEY`).
 
-**WebRTC needs a native module.** The conversational path uses [`@koush/wrtc`](https://www.npmjs.com/package/@koush/wrtc) (N-API v3) for the peer connection and raw-PCM audio source/sink. It is a normal dependency, but its prebuilt binary is fetched by an install script. If your npm blocks install scripts (`allow-scripts` / `ignore-scripts`), the binary will be missing and the codex conversational path fails with a clear error. Fix it with either:
+**WebRTC needs a native module.** The conversational path uses [`@roamhq/wrtc`](https://www.npmjs.com/package/@roamhq/wrtc) for the peer connection and the nonstandard raw-PCM audio source/sink. Its prebuilt binary ships as a platform package (e.g. `@roamhq/wrtc-darwin-arm64`), so a plain `npm install` is enough — no install-script approval required.
 
-```bash
-npm install-scripts approve @koush/wrtc   # then reinstall
-# or fetch the prebuilt binary directly:
-npx node-pre-gyp install --directory=node_modules/@koush/wrtc
-```
+> **Do not substitute `@koush/wrtc`.** In `@koush/wrtc` 0.5.3 `RTCAudioSink` yields **zero frames for a remote track**: inbound RTP arrives and every packet is discarded before the decoder (`packetsDiscarded` climbs while `jitterBufferEmittedCount` stays `0`), so the assistant is never audible even though transcripts arrive normally. Confirmed with a plain local peer-to-peer loopback and a 440 Hz tone — no Codex involved — which rules out signaling. The maintained `@roamhq` fork decodes the identical stream correctly.
 
 Audio is bridged as 16-bit PCM: mic frames go in at the session rate (24 kHz, which Opus accepts natively) in 10 ms chunks, and the decoded remote track is downmixed to mono and resampled to 24 kHz so the existing `PcmStreamPlayer` is reused unchanged.
 
@@ -296,7 +292,8 @@ Without `play`, barge-in truncate timing still works; you just won't hear audio 
 | `text realtime output modality requires realtime v2` | Update to the latest branch/PR version; transcription now selects V2 text automatically while conversational mode uses V3 audio. |
 | `realtime voice \`<name>\` is not supported for v3` | Codex V3 audio only accepts: juniper, maple, spruce, ember, vale, breeze, arbor, sol, cove. The adapter drops an unsupported `PI_VOICE_VOICE` (e.g. the default `marin`) and lets Codex pick its own; set `PI_VOICE_VOICE=juniper` to choose one. |
 | `realtime conversation requires API key auth` | You're on a WebSocket-transport realtime session with ChatGPT OAuth. Use `PI_VOICE_MODE=conversational` (WebRTC, OAuth works), or set `OPENAI_API_KEY` / `PI_VOICE_API_KEY` for transcription. |
-| `requires the \`@koush/wrtc\` native module` | The WebRTC prebuilt binary didn't install (npm blocked the install script). Run `npm install-scripts approve @koush/wrtc` and reinstall, or `npx node-pre-gyp install --directory=node_modules/@koush/wrtc`. |
+| `requires the \`@roamhq/wrtc\` native module` | Run `npm install` in `extensions/pi-live`. The binary ships as a platform package (e.g. `@roamhq/wrtc-darwin-arm64`) and needs no install-script approval. |
+| Transcripts appear but **no audio is heard** | Check you're on `@roamhq/wrtc`, not `@koush/wrtc` — the latter discards every inbound RTP packet before the decoder, so the remote track is permanently silent. `npm ls @roamhq/wrtc` should resolve. |
 | `Field \`session.model\` is not allowed for this Codex realtime session` | Fixed — the adapter no longer sends a model over WebRTC. If you still see it, update to the latest branch/PR version. Choose the model in `~/.codex/config.toml`. |
 | `codex realtime rejected start` | Check the full reported message, Codex version, and model/account entitlement. Use `PI_VOICE_BACKEND=openai` to return to the default backend. |
 | `sox/rec not found on PATH` | `brew install sox`; ensure Homebrew’s bin is on `PATH` inside the pi process. |
@@ -321,7 +318,7 @@ Without `play`, barge-in truncate timing still works; you just won't hear audio 
 | `realtime-client.ts` | Default GA Realtime WebSocket client (+ `pi_turn` session / tool events) |
 | `backends/index.ts` | Environment-selected `RealtimeClientLike` factory |
 | `backends/codex-app-server.ts` | Experimental Codex app-server realtime adapter (V2 text / V3 audio) |
-| `backends/codex-webrtc.ts` | WebRTC media plane for Codex V3 audio (`@koush/wrtc`): SDP offer/answer, PCM↔Opus track bridging, resampling |
+| `backends/codex-webrtc.ts` | WebRTC media plane for Codex V3 audio (`@roamhq/wrtc`): SDP offer/answer, PCM↔Opus track bridging, resampling |
 | `capture.ts` | mic → PCM16 mono via sox/rec |
 | `bridge.ts` | final text → `pi.sendUserMessage` (idle / steer) |
 | `playback.ts` | TTS speak-back (`say` / OpenAI / off) |

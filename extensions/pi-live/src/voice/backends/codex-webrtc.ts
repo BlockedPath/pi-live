@@ -13,10 +13,11 @@
  *   thread/realtime/start  → { transport:{type:"webrtc", sdp:<offer>} }
  *   thread/realtime/sdp    ← { sdp:<answer> }   (notification)
  *
- * `@koush/wrtc` (a Node WebRTC native addon, N-API v3) provides the
- * `RTCPeerConnection` + nonstandard `RTCAudioSource`/`RTCAudioSink`. It is
+ * `@roamhq/wrtc` (a Node WebRTC native addon) provides the `RTCPeerConnection`
+ * plus the nonstandard `RTCAudioSource`/`RTCAudioSink` raw-PCM APIs. It is
  * loaded lazily so the default install only pays for it when the codex WebRTC
  * path is used. The module is injectable for unit tests (no native binary).
+ * See {@link loadWrtc} for why the older `@koush/wrtc` cannot be used.
  *
  * Audio is 16-bit PCM. The mic arrives at the session's 24 kHz rate (Opus
  * accepts 24 kHz input natively, so no upsampling is needed). The remote track
@@ -89,7 +90,7 @@ export interface WrtcAudioSink {
 	stop(): void;
 }
 
-/** Injectable shape of the `@koush/wrtc` module (loaded lazily in production). */
+/** Injectable shape of the `@roamhq/wrtc` module (loaded lazily in production). */
 export interface WrtcModule {
 	RTCPeerConnection: new (config?: unknown) => WrtcPeerConnection;
 	RTCSessionDescription: new (init: {
@@ -105,27 +106,35 @@ export interface WrtcModule {
 let cachedWrtc: WrtcModule | undefined;
 
 /**
- * Lazily require `@koush/wrtc`. Throws a typed error if the native binary is
- * missing (e.g. install scripts were blocked) so the backend can surface it.
+ * Lazily require `@roamhq/wrtc`. Throws a typed error if the native binary is
+ * missing so the backend can surface an actionable message.
+ *
+ * NOTE: must be `@roamhq/wrtc`, NOT the older `@koush/wrtc`. In `@koush/wrtc`
+ * 0.5.3 `RTCAudioSink` silently produces ZERO frames for a REMOTE track:
+ * inbound RTP arrives and then every packet is dropped before the decoder
+ * (`packetsDiscarded` climbs, `jitterBufferEmittedCount` stays 0), so the
+ * assistant is never audible. Reproduced with a plain local pc→pc loopback and
+ * a 440 Hz tone — no Codex involved — which rules out our signaling. The
+ * maintained `@roamhq` fork decodes the identical stream correctly.
  */
 export function loadWrtc(): WrtcModule {
 	if (cachedWrtc) return cachedWrtc;
 	const req = createRequire(import.meta.url);
 	let mod: WrtcModule;
 	try {
-		mod = req("@koush/wrtc") as WrtcModule;
+		mod = req("@roamhq/wrtc") as WrtcModule;
 	} catch {
 		throw new Error(
-			"codex WebRTC backend requires the `@koush/wrtc` native module. " +
-				"Run `npm install @koush/wrtc` in extensions/pi-live and ensure its " +
-				"prebuilt binary downloaded (npm install-scripts may need approval, " +
-				"or run `npx node-pre-gyp install --directory=node_modules/@koush/wrtc`).",
+			"codex WebRTC backend requires the `@roamhq/wrtc` native module. " +
+				"Run `npm install` in extensions/pi-live. The prebuilt binary ships as " +
+				"a platform package (e.g. @roamhq/wrtc-darwin-arm64), so no install " +
+				"script approval is needed.",
 		);
 	}
 	if (!mod?.RTCPeerConnection || !mod?.nonstandard?.RTCAudioSource) {
 		throw new Error(
-			"`@koush/wrtc` loaded but is missing the nonstandard audio APIs — " +
-				"the prebuilt binary likely did not install. See the README install note.",
+			"`@roamhq/wrtc` loaded but is missing the nonstandard audio APIs — " +
+				"the platform binary likely did not install. See the README install note.",
 		);
 	}
 	cachedWrtc = mod;

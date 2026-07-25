@@ -77,7 +77,7 @@
  *      transport works over OAuth, and it is audio-only. So:
  *        conversational/audio → WebRTC   (works with ChatGPT/Codex OAuth)
  *        transcription/text   → WebSocket (requires an OpenAI API key)
- *      WebRTC media is handled by `./codex-webrtc.ts` (`@koush/wrtc`): the SDP
+ *      WebRTC media is handled by `./codex-webrtc.ts` (`@roamhq/wrtc`): the SDP
  *      offer is generated locally (non-trickle, ICE candidates included), sent
  *      as `transport:{type:"webrtc", sdp}`, and the app-server replies with a
  *      `thread/realtime/sdp` answer notification.
@@ -355,7 +355,7 @@ export interface CodexAppServerBackendOptions {
 	 * `websocket` for text/transcription (which has no media plane).
 	 */
 	realtimeTransport?: "websocket" | "webrtc";
-	/** Injectable `@koush/wrtc` (tests). Production loads it lazily. */
+	/** Injectable `@roamhq/wrtc` (tests). Production loads it lazily. */
 	wrtc?: WrtcModule;
 }
 

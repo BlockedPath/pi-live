@@ -32,7 +32,7 @@ import type {
 } from "./codex-webrtc.ts";
 
 /**
- * Mock `@koush/wrtc`. Conversational/audio mode defaults to the WebRTC
+ * Mock `@roamhq/wrtc`. Conversational/audio mode defaults to the WebRTC
  * transport, so tests MUST inject this — otherwise they load the real native
  * addon, open a real peer connection, and keep the event loop alive forever.
  */
