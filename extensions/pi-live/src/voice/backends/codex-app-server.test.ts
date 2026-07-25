@@ -21,6 +21,123 @@ import {
 	type CodexSpawnFn,
 	type CodexTransport,
 } from "./codex-app-server.ts";
+import type {
+	WrtcAudioFrame,
+	WrtcAudioSink,
+	WrtcAudioSource,
+	WrtcModule,
+	WrtcPeerConnection,
+	WrtcTrack,
+	WrtcTrackEvent,
+} from "./codex-webrtc.ts";
+
+/**
+ * Mock `@koush/wrtc`. Conversational/audio mode defaults to the WebRTC
+ * transport, so tests MUST inject this — otherwise they load the real native
+ * addon, open a real peer connection, and keep the event loop alive forever.
+ */
+class MockWrtc implements WrtcModule {
+	/** Every peer connection the backend created (usually one). */
+	readonly pcs: MockPeerConnection[] = [];
+	readonly sources: MockAudioSource[] = [];
+	readonly sinks: MockAudioSink[] = [];
+
+	/** Constructor-callable factories (the backend uses `new`). */
+	RTCPeerConnection: WrtcModule["RTCPeerConnection"];
+	RTCSessionDescription: WrtcModule["RTCSessionDescription"];
+	nonstandard: WrtcModule["nonstandard"];
+
+	constructor() {
+		const self = this;
+		this.RTCPeerConnection = function () {
+			const pc = new MockPeerConnection();
+			self.pcs.push(pc);
+			return pc;
+		} as unknown as WrtcModule["RTCPeerConnection"];
+		this.RTCSessionDescription = function (init: {
+			type: string;
+			sdp: string;
+		}) {
+			return { type: init.type, sdp: init.sdp };
+		} as unknown as WrtcModule["RTCSessionDescription"];
+		this.nonstandard = {
+			RTCAudioSource: function () {
+				const src = new MockAudioSource();
+				self.sources.push(src);
+				return src;
+			} as unknown as WrtcModule["nonstandard"]["RTCAudioSource"],
+			RTCAudioSink: function (track: WrtcTrack) {
+				const sink = new MockAudioSink(track);
+				self.sinks.push(sink);
+				return sink;
+			} as unknown as WrtcModule["nonstandard"]["RTCAudioSink"],
+		};
+	}
+}
+
+class MockPeerConnection implements WrtcPeerConnection {
+	localDescription: { type: string; sdp: string } | null = null;
+	remoteDescription: { type: string; sdp: string } | null = null;
+	connectionState = "new";
+	/** Already complete so createOffer() never polls/waits. */
+	iceGatheringState = "complete";
+	ontrack: ((e: WrtcTrackEvent) => void) | null = null;
+	onconnectionstatechange: (() => void) | null = null;
+	readonly addedTracks: WrtcTrack[] = [];
+	closed = false;
+
+	addTrack(track: WrtcTrack) {
+		this.addedTracks.push(track);
+		return { track };
+	}
+	async createOffer() {
+		return {
+			type: "offer",
+			sdp: "v=0\r\no=- MOCK OFFER\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+		};
+	}
+	async setLocalDescription(desc: { type: string; sdp: string }) {
+		this.localDescription = desc;
+	}
+	async setRemoteDescription(desc: { type: string; sdp: string }) {
+		this.remoteDescription = desc;
+	}
+	close() {
+		this.closed = true;
+	}
+	/** Simulate the remote assistant audio track arriving. */
+	emitTrack(track: WrtcTrack) {
+		this.ontrack?.({ track, receiver: { track }, transceivers: [] });
+	}
+}
+
+class MockAudioSource implements WrtcAudioSource {
+	/** Every 10 ms frame the backend pushed. */
+	readonly pushed: Int16Array[] = [];
+	readonly track: WrtcTrack = { kind: "audio", enabled: true, stop() {} };
+	createTrack() {
+		return this.track;
+	}
+	onData(data: { samples: Int16Array }) {
+		this.pushed.push(data.samples);
+	}
+}
+
+class MockAudioSink implements WrtcAudioSink {
+	stopped = false;
+	ondata: ((frame: WrtcAudioFrame) => void) | null = null;
+	readonly track: WrtcTrack;
+	constructor(track: WrtcTrack) {
+		this.track = track;
+	}
+	stop() {
+		this.stopped = true;
+	}
+	/** Simulate decoded remote PCM arriving from the peer. */
+	emit(frame: WrtcAudioFrame) {
+		this.ondata?.(frame);
+	}
+}
 
 /** Minimal fake transport — captures sent lines, lets tests deliver lines. */
 class FakeTransport implements CodexTransport {
@@ -185,20 +302,55 @@ describe("CodexAppServerBackend — handshake", () => {
 		assert.equal(realtime?.voice, "marin");
 	});
 
-	it("uses audio outputModality in conversational mode", async () => {
+	it("uses audio outputModality over WebRTC in conversational mode", async () => {
 		const transport = new FakeTransport();
-		const backend = new CodexAppServerBackend({ transport, skipDetect: true });
+		const wrtc = new MockWrtc();
+		const backend = new CodexAppServerBackend({
+			transport,
+			skipDetect: true,
+			wrtc,
+		});
 		await happyConnect(backend, transport, "conversational");
 		const realtime = transport.lastSentOfType("thread/realtime/start");
 		assert.equal(realtime?.outputModality, "audio");
 		assert.equal(realtime?.version, "v3");
 		// Default `marin` is NOT a V3 voice — it must be dropped, not forwarded.
 		assert.equal(realtime?.voice, undefined);
+		// G7: audio realtime must negotiate WebRTC (the only OAuth-capable path),
+		// carrying a locally generated SDP offer.
+		const rtcTransport = realtime?.transport as
+			| { type?: string; sdp?: string }
+			| undefined;
+		assert.equal(rtcTransport?.type, "webrtc");
+		assert.match(String(rtcTransport?.sdp), /^v=0/);
+		assert.match(String(rtcTransport?.sdp), /m=audio/);
+		// A local audio track was added to the peer connection.
+		assert.equal(wrtc.pcs.length, 1);
+		assert.equal(wrtc.pcs[0]?.addedTracks.length, 1);
+		backend.close();
+	});
+
+	it("transcription mode stays on the WebSocket transport (no WebRTC)", async () => {
+		const transport = new FakeTransport();
+		const wrtc = new MockWrtc();
+		const backend = new CodexAppServerBackend({
+			transport,
+			skipDetect: true,
+			wrtc,
+		});
+		await happyConnect(backend, transport, "transcription");
+		const realtime = transport.lastSentOfType("thread/realtime/start");
+		assert.equal(realtime?.transport, undefined);
+		assert.equal(wrtc.pcs.length, 0, "no peer connection for text mode");
 	});
 
 	it("forwards a supported V3 voice in conversational mode", async () => {
 		const transport = new FakeTransport();
-		const backend = new CodexAppServerBackend({ transport, skipDetect: true });
+		const backend = new CodexAppServerBackend({
+			transport,
+			skipDetect: true,
+			wrtc: new MockWrtc(),
+		});
 		const connectPromise = backend.connect(
 			{},
 			{ model: "gpt-realtime-2.1", voice: "juniper", mode: "conversational" },
@@ -216,6 +368,7 @@ describe("CodexAppServerBackend — handshake", () => {
 		await connectPromise;
 		const realtime = transport.lastSentOfType("thread/realtime/start");
 		assert.equal(realtime?.voice, "juniper");
+		backend.close();
 	});
 
 	it("rejects when thread/realtime/error arrives before started", async () => {
@@ -479,6 +632,147 @@ describe("CodexAppServerBackend — audio + lifecycle", () => {
 		);
 		// No session.update-style message sent to codex.
 		assert.equal(transport.sent.length, 0);
+	});
+});
+
+describe("CodexAppServerBackend — WebRTC media (G7)", () => {
+	/** Connect in conversational mode with a mock wrtc, returning the pieces. */
+	async function connectWebRtc() {
+		const transport = new FakeTransport();
+		const wrtc = new MockWrtc();
+		const backend = new CodexAppServerBackend({
+			transport,
+			skipDetect: true,
+			wrtc,
+		});
+		await happyConnect(backend, transport, "conversational");
+		return { backend, transport, wrtc };
+	}
+
+	it("applies the app-server SDP answer to the peer connection", async () => {
+		const { backend, transport, wrtc } = await connectWebRtc();
+		const answer = "v=0\r\no=- MOCK ANSWER\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n";
+		transport.receive({
+			method: "thread/realtime/sdp",
+			params: { threadId: "thr_123", sdp: answer },
+		});
+		// setRemoteDescription is async; let the microtask queue drain.
+		await new Promise((r) => setImmediate(r));
+		const pc = wrtc.pcs[0];
+		assert.equal(pc?.remoteDescription?.type, "answer");
+		assert.equal(pc?.remoteDescription?.sdp, answer);
+		backend.close();
+	});
+
+	it("feeds mic PCM into the audio track as 10 ms frames (not JSON-RPC)", async () => {
+		const { backend, transport, wrtc } = await connectWebRtc();
+		transport.sent.length = 0;
+		// 25 ms of 24 kHz mono PCM16 = 600 samples = 1200 bytes.
+		const samples = 600;
+		const pcm = new Uint8Array(samples * 2);
+		for (let i = 0; i < samples; i++) {
+			// Include negative values to catch signed-encoding bugs.
+			const v = i % 2 === 0 ? 1000 : -1000;
+			pcm[i * 2] = v & 0xff;
+			pcm[i * 2 + 1] = (v >> 8) & 0xff;
+		}
+		backend.appendAudio(pcm);
+
+		const src = wrtc.sources[0];
+		// 600 samples @ 24 kHz = two full 240-sample frames, 120 buffered.
+		assert.equal(src?.pushed.length, 2);
+		assert.equal(src?.pushed[0]?.length, 240);
+		assert.equal(src?.pushed[0]?.[0], 1000);
+		assert.equal(src?.pushed[0]?.[1], -1000, "negative PCM must survive");
+		// Nothing went over JSON-RPC on the WebRTC path.
+		assert.equal(transport.sentOfType("thread/realtime/appendAudio").length, 0);
+
+		// The remaining 120 samples flush once another 120 arrive.
+		backend.appendAudio(new Uint8Array(120 * 2));
+		assert.equal(src?.pushed.length, 3);
+		backend.close();
+	});
+
+	it("emits remote track audio as audio.delta, resampled 48k→24k mono", async () => {
+		const { backend, wrtc } = await connectWebRtc();
+		const audioDeltas: unknown[] = [];
+		backend.on("audio.delta", (e) => audioDeltas.push(e));
+
+		// Simulate the assistant's remote track arriving, then decoded PCM.
+		const pc = wrtc.pcs[0];
+		assert.ok(pc, "peer connection exists");
+		pc.emitTrack({ kind: "audio", enabled: true, stop() {} });
+		const sink = wrtc.sinks[0];
+		assert.ok(sink, "sink was created for the remote track");
+
+		// 20 ms of 48 kHz mono = 960 samples → 480 samples at 24 kHz.
+		const frame = new Int16Array(960);
+		for (let i = 0; i < 960; i++) frame[i] = i % 2 === 0 ? 2000 : -2000;
+		sink.emit({
+			samples: frame,
+			sampleRate: 48_000,
+			bitsPerSample: 16,
+			channelCount: 1,
+			numberOfFrames: 960,
+		});
+
+		assert.equal(audioDeltas.length, 1);
+		const delta = (audioDeltas[0] as { delta: string }).delta;
+		const bytes = Buffer.from(delta, "base64");
+		// Downsampled to 24 kHz → 480 samples → 960 bytes.
+		assert.equal(bytes.length, 960);
+		backend.close();
+	});
+
+	it("downmixes stereo remote audio to mono", async () => {
+		const { backend, wrtc } = await connectWebRtc();
+		const audioDeltas: unknown[] = [];
+		backend.on("audio.delta", (e) => audioDeltas.push(e));
+		wrtc.pcs[0]?.emitTrack({ kind: "audio", enabled: true, stop() {} });
+		const sink = wrtc.sinks[0];
+		// 10 ms stereo @ 24 kHz = 240 frames × 2 channels = 480 samples.
+		const interleaved = new Int16Array(480);
+		for (let i = 0; i < 240; i++) {
+			interleaved[i * 2] = 1000; // L
+			interleaved[i * 2 + 1] = 3000; // R → mono average 2000
+		}
+		sink?.emit({
+			samples: interleaved,
+			sampleRate: 24_000,
+			bitsPerSample: 16,
+			channelCount: 2,
+			numberOfFrames: 240,
+		});
+		const bytes = Buffer.from(
+			(audioDeltas[0] as { delta: string }).delta,
+			"base64",
+		);
+		// 240 mono samples, each the average of L/R.
+		assert.equal(bytes.length, 480);
+		assert.equal(bytes.readInt16LE(0), 2000);
+		backend.close();
+	});
+
+	it("close() tears down the peer connection, track, and sink", async () => {
+		const { backend, wrtc } = await connectWebRtc();
+		wrtc.pcs[0]?.emitTrack({ kind: "audio", enabled: true, stop() {} });
+		backend.close();
+		assert.equal(wrtc.pcs[0]?.closed, true, "peer connection closed");
+		assert.equal(wrtc.sinks[0]?.stopped, true, "audio sink stopped");
+	});
+
+	it("an SDP answer with no active media plane is ignored", async () => {
+		const transport = new FakeTransport();
+		const backend = new CodexAppServerBackend({ transport, skipDetect: true });
+		// Transcription mode → no WebRTC media; a stray sdp must not throw.
+		await happyConnect(backend, transport, "transcription");
+		assert.doesNotThrow(() => {
+			transport.receive({
+				method: "thread/realtime/sdp",
+				params: { threadId: "thr_123", sdp: "v=0\r\n" },
+			});
+		});
+		assert.equal(backend.connected, true);
 	});
 });
 

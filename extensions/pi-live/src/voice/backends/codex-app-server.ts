@@ -71,6 +71,16 @@
  *      interface) because the V3 voice plane does not use Realtime tool-call
  *      round-trips. The session calls them with optional-chaining (`?.()`),
  *      so their absence is safe.
+ *  G7. AUTH/TRANSPORT: the app-server rejects WebSocket-transport realtime on a
+ *      ChatGPT-OAuth account with `realtime conversation requires API key auth`
+ *      (verified against 0.145 for BOTH V2 text and V3 audio). Only the WebRTC
+ *      transport works over OAuth, and it is audio-only. So:
+ *        conversational/audio → WebRTC   (works with ChatGPT/Codex OAuth)
+ *        transcription/text   → WebSocket (requires an OpenAI API key)
+ *      WebRTC media is handled by `./codex-webrtc.ts` (`@koush/wrtc`): the SDP
+ *      offer is generated locally (non-trickle, ICE candidates included), sent
+ *      as `transport:{type:"webrtc", sdp}`, and the app-server replies with a
+ *      `thread/realtime/sdp` answer notification.
  *
  * Unit tests inject a fake `CodexTransport` — no real `codex` process and no
  * network are required.
@@ -83,6 +93,7 @@ import {
 
 import type { RealtimeAudioDeltaEvent } from "../realtime-client.js";
 import type { RealtimeClientLike, TranscriptEvent } from "../types.js";
+import { CodexWebRtcMedia, type WrtcModule } from "./codex-webrtc.js";
 
 /** Codex binary used when spawning the app-server (override in tests). */
 export const DEFAULT_CODEX_BIN = "codex";
@@ -332,6 +343,15 @@ export interface CodexAppServerBackendOptions {
 	 * and V3 for audio/conversational, matching Codex CLI 0.145 constraints.
 	 */
 	version?: "v1" | "v2" | "v3";
+	/**
+	 * Realtime media transport. `webrtc` is the ONLY transport the app-server
+	 * accepts with ChatGPT/Codex OAuth; `websocket` (raw PCM over JSON-RPC)
+	 * requires an OpenAI API key. Default: `webrtc` for audio/conversational,
+	 * `websocket` for text/transcription (which has no media plane).
+	 */
+	realtimeTransport?: "websocket" | "webrtc";
+	/** Injectable `@koush/wrtc` (tests). Production loads it lazily. */
+	wrtc?: WrtcModule;
 }
 
 /**
@@ -346,6 +366,8 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 	readonly #spawn?: CodexSpawnFn;
 	readonly #injectedTransport?: CodexTransport;
 	readonly #skipDetect: boolean;
+	readonly #realtimeTransport?: "websocket" | "webrtc";
+	readonly #wrtc?: WrtcModule;
 
 	#transport: CodexTransport | undefined;
 	#connected = false;
@@ -354,6 +376,8 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 	#pending = new Map<number, PendingRequest>();
 	#threadId: string | undefined;
 	#listeners = new Map<string, Set<Handler>>();
+	/** Active WebRTC media plane (audio/conversational over OAuth). */
+	#media: CodexWebRtcMedia | undefined;
 
 	/** Used to synthesize user speech.started/stopped (G2). */
 	#userSpeaking = false;
@@ -365,6 +389,8 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 		this.#spawn = options.spawn;
 		this.#injectedTransport = options.transport;
 		this.#skipDetect = options.skipDetect ?? false;
+		this.#realtimeTransport = options.realtimeTransport;
+		this.#wrtc = options.wrtc;
 	}
 
 	/** True once `thread/realtime/started` has arrived. */
@@ -457,6 +483,33 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 				realtimeParams.voice = cfg.voice;
 			}
 
+			// Media transport. WebRTC is the only OAuth-capable path; the WebSocket
+			// PCM path needs an OpenAI API key. Text has no media plane.
+			const wantWebRtc =
+				(this.#realtimeTransport ??
+					(outputModality === "audio" ? "webrtc" : "websocket")) === "webrtc";
+			if (wantWebRtc) {
+				const media = new CodexWebRtcMedia({
+					wrtc: this.#wrtc,
+					micSampleRate: cfg.sampleRate ?? 24_000,
+					outSampleRate: cfg.sampleRate ?? 24_000,
+					onAudio: (base64) => {
+						const ev: RealtimeAudioDeltaEvent = {
+							delta: base64,
+							itemId: undefined,
+							timestamp: Date.now(),
+						};
+						this.#emit("audio.delta", ev);
+					},
+				});
+				this.#media = media;
+				// Non-trickle: the offer carries gathered ICE candidates.
+				realtimeParams.transport = {
+					type: "webrtc",
+					sdp: await media.createOffer(),
+				};
+			}
+
 			// Subscribe before sending: app-server can return the response and
 			// started notification in the same stdout batch.
 			const started = this.#waitForStarted();
@@ -469,6 +522,7 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 			]);
 			this.#connected = true;
 		} catch (err) {
+			this.#closeMedia();
 			this.#teardownTransport();
 			if (err instanceof CodexBackendError) throw err;
 			throw new CodexBackendError(
@@ -549,6 +603,16 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 
 	appendAudio(pcm16Base64OrBuffer: string | Uint8Array): void {
 		if (!this.#connected || !this.#threadId) return;
+		// WebRTC path: mic PCM goes into the RTP audio track, not JSON-RPC.
+		const media = this.#media;
+		if (media) {
+			const bytes =
+				typeof pcm16Base64OrBuffer === "string"
+					? new Uint8Array(Buffer.from(pcm16Base64OrBuffer, "base64"))
+					: pcm16Base64OrBuffer;
+			media.feedMicBytes(bytes);
+			return;
+		}
 		const data =
 			typeof pcm16Base64OrBuffer === "string"
 				? pcm16Base64OrBuffer
@@ -568,6 +632,16 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 		}).catch(() => undefined);
 	}
 
+	#closeMedia(): void {
+		const media = this.#media;
+		this.#media = undefined;
+		try {
+			media?.close();
+		} catch {
+			// ignore
+		}
+	}
+
 	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;
@@ -579,6 +653,7 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 				() => undefined,
 			);
 		}
+		this.#closeMedia();
 		this.#teardownTransport();
 		// Let session reconnect/stop listeners see a normal close.
 		this.#emit("close", { code: 1000, reason: "client close" });
@@ -786,8 +861,21 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 				});
 				break;
 			}
+			case "thread/realtime/sdp": {
+				// WebRTC answer from the app-server; completes the media handshake.
+				const sdp = typeof params.sdp === "string" ? params.sdp : undefined;
+				const media = this.#media;
+				if (!sdp || !media) break;
+				void media.setAnswer(sdp).catch((err: unknown) => {
+					this.#emit("error", {
+						message: `codex WebRTC answer rejected: ${err instanceof Error ? err.message : String(err)}`,
+						raw: err,
+					});
+				});
+				break;
+			}
 			default:
-			// Unknown notifications (incl. itemAdded, sdp) are surfaced via
+			// Unknown notifications (incl. itemAdded) are surfaced via
 			// the raw internal channel above; no typed mapping yet.
 		}
 	}
@@ -805,6 +893,7 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 
 	#handleTransportClose(): void {
 		const wasConnected = this.#connected;
+		this.#closeMedia();
 		this.#connected = false;
 		// Reject pending requests so connect() doesn't hang forever.
 		const pending = Array.from(this.#pending.values());

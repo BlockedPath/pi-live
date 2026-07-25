@@ -19,6 +19,29 @@ import {
 	type CodexSpawnFn,
 } from "./codex-app-server.js";
 
+export {
+	CodexAppServerBackend,
+	CodexBackendError,
+	CODEX_V3_VOICES,
+	DEFAULT_CODEX_BIN,
+	detectCodexCli,
+	type CodexAppServerBackendOptions,
+	type CodexBackendErrorCode,
+	type CodexDetectResult,
+	type CodexSpawnFn,
+	type CodexTransport,
+} from "./codex-app-server.js";
+
+export {
+	CodexWebRtcMedia,
+	loadWrtc,
+	resampleMono,
+	setWrtc,
+	type CodexWebRtcMediaOptions,
+	type WrtcAudioFrame,
+	type WrtcModule,
+} from "./codex-webrtc.js";
+
 export interface CreateVoiceClientOptions {
 	/** Injectable spawn for the codex app-server child (tests). */
 	spawn?: CodexSpawnFn;
@@ -37,16 +60,3 @@ export function createVoiceClient(
 	}
 	return new RealtimeClient();
 }
-
-export {
-	CodexAppServerBackend,
-	CodexBackendError,
-	CODEX_V3_VOICES,
-	DEFAULT_CODEX_BIN,
-	detectCodexCli,
-	type CodexAppServerBackendOptions,
-	type CodexBackendErrorCode,
-	type CodexDetectResult,
-	type CodexSpawnFn,
-	type CodexTransport,
-} from "./codex-app-server.js";
