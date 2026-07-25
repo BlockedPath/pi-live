@@ -218,8 +218,9 @@ export interface CodexWebRtcMediaOptions {
 	/** Output PCM rate for the remote audio delta (default 24000). */
 	outSampleRate?: number;
 	/**
-	 * Frames whose RMS is at or below this are treated as silence and not
-	 * forwarded (default 120). Measured speech sits around 8000+ while the
+	 * Frames whose RMS is at or below this are treated as silence (default 120).
+	 * Idle silence is not forwarded, while silence inside an active utterance is
+	 * retained to preserve pauses. Measured speech sits around 8000+ while the
 	 * track's idle comfort noise is 0, so this is a wide margin.
 	 */
 	silenceRmsThreshold?: number;
@@ -336,16 +337,18 @@ export class CodexWebRtcMedia {
 		const mono = downmixMono(frame);
 
 		// G9: the sink emits a continuous 10 ms frame stream for the whole session,
-		// including digital silence between utterances. Forwarding those kept
-		// `PcmStreamPlayer` permanently "speaking", which holds capture paused for
-		// echo suppression — so the mic never reopened after the first reply.
-		// Only forward audible frames, and finalize playback after a silence gap.
-		if (frameRms(mono) <= this.#silenceRms) {
-			if (this.#remoteActive) this.#armSilenceTimer();
-			return;
+		// including digital silence between utterances. Do not forward idle silence: it
+		// would keep PcmStreamPlayer speaking forever and hold capture paused. But do
+		// preserve silence while an utterance is active — dropping those 10 ms frames
+		// collapses natural pauses and makes speech robotic or stuttery.
+		const isSilent = frameRms(mono) <= this.#silenceRms;
+		if (isSilent) {
+			if (!this.#remoteActive) return;
+			this.#armSilenceTimer();
+		} else {
+			this.#clearSilenceTimer();
+			this.#remoteActive = true;
 		}
-		this.#clearSilenceTimer();
-		this.#remoteActive = true;
 
 		const resampled = resampleMono(mono, frame.sampleRate, this.#outRate);
 		if (resampled.length === 0) return;

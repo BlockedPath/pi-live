@@ -843,12 +843,11 @@ describe("CodexAppServerBackend — WebRTC media (G7)", () => {
 
 	/**
 	 * G9 regression: the remote track emits frames CONTINUOUSLY for the whole
-	 * session, including digital silence between utterances. Forwarding those as
-	 * audio.delta keeps PcmStreamPlayer "speaking" forever, which makes the
-	 * session hold mic capture paused for echo suppression — the mic never
-	 * reopens after the first reply.
+	 * session, including digital silence between utterances. Idle silence must not
+	 * keep PcmStreamPlayer speaking forever, but silence within an active utterance
+	 * must be retained; dropping it compresses natural speech pauses into stutter.
 	 */
-	it("drops silent remote frames so playback does not stay speaking (G9)", async () => {
+	it("preserves active-utterance silence but drops idle remote frames (G9)", async () => {
 		const { backend, wrtc } = await connectWebRtc();
 		const audioDeltas: unknown[] = [];
 		backend.on("audio.delta", (e) => audioDeltas.push(e));
@@ -867,17 +866,19 @@ describe("CodexAppServerBackend — WebRTC media (G7)", () => {
 			});
 		};
 
-		// Digital silence (what an idle track sends) must not be forwarded.
+		// Digital silence before speech is idle and must not be forwarded.
 		emit(() => 0);
-		assert.equal(audioDeltas.length, 0, "silent frames must be dropped");
+		assert.equal(audioDeltas.length, 0);
 
-		// Real speech is forwarded.
+		// Preserve the 10 ms silent pause inside an otherwise audible utterance.
 		emit((i) => (i % 2 === 0 ? 8000 : -8000));
-		assert.equal(audioDeltas.length, 1, "audible frames must pass through");
-
-		// Silence after speech is still dropped.
 		emit(() => 0);
-		assert.equal(audioDeltas.length, 1);
+		assert.equal(audioDeltas.length, 2, "active silence must reach playback");
+		const pause = Buffer.from(
+			(audioDeltas[1] as { delta: string }).delta,
+			"base64",
+		);
+		assert.ok(pause.every((sample) => sample === 0));
 		backend.close();
 	});
 

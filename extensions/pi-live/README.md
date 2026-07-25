@@ -119,7 +119,7 @@ The app-server rejects *all* WebSocket-transport realtime on a ChatGPT-OAuth acc
 
 Audio is bridged as 16-bit PCM: mic frames go in at the session rate (24 kHz, which Opus accepts natively) in 10 ms chunks, and the decoded remote track is downmixed to mono and resampled to 24 kHz so the existing `PcmStreamPlayer` is reused unchanged.
 
-The remote track emits 10 ms frames **continuously for the whole session**, including digital silence between utterances — it never goes quiet. Silent frames are therefore dropped by RMS instead of being forwarded as audio, and a silence gap is used as the end-of-utterance signal (the transport has no completion event). Without that gating, playback would stay in the "speaking" state forever and the session would hold mic capture paused for echo suppression, so **the mic would never reopen after the first reply**.
+The remote track emits 10 ms frames **continuously for the whole session**, including digital silence between utterances — it never goes quiet. Idle silence is gated and a silence gap is used as the end-of-utterance signal (the transport has no completion event), so playback can finish and capture can resume. Silence inside an active utterance remains in the PCM stream; dropping it would compress natural pauses into robotic, stuttering speech.
 
 Codex realtime limitations:
 
@@ -311,7 +311,7 @@ Without `play`, barge-in truncate timing still works; you just won't hear audio 
 | `micChunks` rising but `lvl=0%` / `mic silent` | **Capture works; the device is silent.** On macOS: System Settings → Privacy & Security → **Microphone** → enable **Ghostty** (or whatever hosts the shell). Confirm default input is the real mic. Or force a device: `PI_VOICE_INPUT_DEVICE='iPhone Microphone'` (restart pi). CLI check while speaking: `sox -t coreaudio "iPhone Microphone" -n stat trim 0 1` — `Maximum amplitude` should be ≫ 0. |
 | Transcript but pi does nothing | Bridge needs the extension’s `sendUserMessage`; ensure you started voice from inside pi (not a bare unit test). |
 | Capture never resumes | Agent should fire `agent_settled`; `/voice stop` then `/voice start` recovers. |
-| Codex conversational: mic stops being picked up after the first reply | Playback is stuck "speaking", so capture stays paused for echo suppression. The remote WebRTC track streams frames non-stop (silence included), so silent frames must be dropped and a silence gap must finalize playback — update to the latest branch/PR version. |
+| Codex conversational: robotic/stuttering speech or mic stops after a reply | The remote WebRTC track streams frames non-stop. Active-utterance silence must stay in PCM to preserve speech pauses, while idle silence must be gated so playback finishes and capture reopens — update to the latest branch/PR version. |
 | No speak-back | Check `PI_VOICE_TTS` (not `off`), voice session is live (`/voice start`), and on OpenAI path you have an API key. macOS: `which say`. |
 | Echo / TTS heard as input | Capture pauses during speak-back plus a short echo-guard hold-off; if residual, set `PI_VOICE_TTS=off` or lower speaker volume. |
 | Prefs not restored after reload | Confirm you started/stopped voice at least once (writes `voice-state`). Explicit `PI_VOICE_*` env overrides saved prefs. |
