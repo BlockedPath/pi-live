@@ -89,6 +89,8 @@ export interface VoiceSessionStatus {
 	relayTarget?: string;
 	/** Delivery mode: local | relay | both. */
 	relayMode?: string;
+	/** Realtime backend in use (`openai` | `codex`). */
+	backend?: "openai" | "codex";
 	/** Present when `state === "error"`. */
 	error?: string;
 }

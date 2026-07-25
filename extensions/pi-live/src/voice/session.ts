@@ -35,12 +35,11 @@ import {
 	voiceStateFromFields,
 	type VoiceStatePrefs,
 } from "./prefs.js";
+import { createVoiceClient } from "./backends/index.js";
 import {
 	buildDefaultSessionConfig,
 	connectConfigFromVoice,
-	RealtimeClient,
 	type RealtimeAudioDeltaEvent,
-	type RealtimeClientError,
 } from "./realtime-client.js";
 import type {
 	FunctionCallEvent,
@@ -156,6 +155,23 @@ function errorMessage(err: unknown): string {
 	return String(err);
 }
 
+/** Render malformed client error events without losing their diagnostic shape. */
+function realtimeErrorMessage(event: unknown): string {
+	if (event && typeof event === "object") {
+		const message = (event as { message?: unknown }).message;
+		if (typeof message === "string" && message.trim()) return message.trim();
+		try {
+			const rendered = JSON.stringify(event);
+			return rendered.length > 1_000
+				? `realtime error: ${rendered.slice(0, 997)}…`
+				: `realtime error: ${rendered}`;
+		} catch {
+			return "realtime error (unserializable event)";
+		}
+	}
+	if (typeof event === "string" && event.trim()) return event.trim();
+	return event === undefined ? "realtime error (empty event)" : `realtime error: ${String(event)}`;
+}
 function defaultDelay(ms: number): Promise<void> {
 	return new Promise((resolve) => {
 		const t = setTimeout(resolve, ms);
@@ -263,7 +279,9 @@ export class VoiceSession {
 					codexHome: options.codexHome,
 					apiKey: options.apiKey,
 				}));
-		this.#createClient = deps.createClient ?? (() => new RealtimeClient());
+		this.#createClient =
+			deps.createClient ??
+			(() => createVoiceClient(this.#config, { spawn: deps.spawn }));
 		this.#createCapture =
 			deps.createCapture ??
 			((opts) =>
@@ -390,6 +408,7 @@ export class VoiceSession {
 			captureBackend: this.#captureBackend,
 			relayTarget: this.#config.relayTarget,
 			relayMode: this.#config.relayMode,
+			backend: this.#config.backend,
 			error: this.#error,
 		};
 	}
@@ -900,8 +919,7 @@ export class VoiceSession {
 		};
 		const onError = (...args: unknown[]) => {
 			if (gen !== this.#generation) return;
-			const err = args[0] as RealtimeClientError | undefined;
-			const message = err?.message ?? "realtime error";
+			const message = realtimeErrorMessage(args[0]);
 			this.#error = message;
 			this.#notify(`voice error: ${message}`, "error");
 			// Stay listening if possible; hard close is handled below.

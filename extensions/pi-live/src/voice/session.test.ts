@@ -146,6 +146,9 @@ class FakeClient implements RealtimeClientLike {
 		this.#emit(kind === "started" ? "speech.started" : "speech.stopped", event);
 	}
 
+	emitError(error?: unknown): void {
+		this.#emit("error", error);
+	}
 	#emit(event: string, ...args: unknown[]): void {
 		const set = this.#listeners.get(event);
 		if (!set) return;
@@ -358,6 +361,14 @@ describe("VoiceSession", () => {
 		});
 	});
 
+	it("renders malformed realtime error events diagnostically", async () => {
+		const { session, client, uiLines } = makeSession();
+		await session.start({ pi: { sendUserMessage: () => undefined } });
+		client.emitError();
+		client.emitError({ code: "upstream_failure", details: "retry" });
+		assert.ok(uiLines.some((line) => /empty event/.test(line)));
+		assert.ok(uiLines.some((line) => /upstream_failure/.test(line)));
+	});
 	it("streams audio only when listening and not paused", async () => {
 		const { session, client, capture } = makeSession();
 		await session.start({
@@ -671,6 +682,26 @@ describe("VoiceSession", () => {
 		assert.match(session.getStatus(), /echo guard|paused/);
 		flushTimers();
 		assert.equal(session.isCapturePaused(), false);
+	});
+
+	it("Codex backend respects the configured auth preference (no force)", async () => {
+		let prefer: string | undefined;
+		const client = new FakeClient();
+		const capture = new FakeCapture();
+		const session = new VoiceSession({
+			config: { ...defaultVoiceConfig, backend: "codex", tts: "off" },
+			resolveAuth: async (options) => {
+				prefer = options.prefer;
+				return fakeAuth();
+			},
+			createClient: () => client,
+			createCapture: () => capture,
+		});
+		await session.start({ pi: { sendUserMessage: () => undefined } });
+		// Codex app-server V3 bidi realtime works with ChatGPT/Codex OAuth —
+		// the backend must NOT force api-key; it follows PI_VOICE_AUTH (auto by default).
+		assert.equal(prefer, "auto");
+		await session.stop();
 	});
 
 	it("defaults to transcription mode", () => {

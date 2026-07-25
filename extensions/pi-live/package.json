@@ -7,7 +7,7 @@
   "main": "./src/index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --import ./src/voice/ts-test-register.mjs --test src/voice/auth.test.ts src/voice/bridge.test.ts src/voice/realtime-client.test.ts src/voice/session.test.ts src/voice/playback.test.ts src/voice/prefs.test.ts",
+    "test": "node --experimental-strip-types --import ./src/voice/ts-test-register.mjs --test src/voice/auth.test.ts src/voice/bridge.test.ts src/voice/realtime-client.test.ts src/voice/session.test.ts src/voice/playback.test.ts src/voice/prefs.test.ts src/voice/backends/codex-app-server.test.ts",
     "pi": "pi -e ./src/index.ts"
   },
   "pi": {
@@ -16,11 +16,12 @@
     ]
   },
   "dependencies": {
+    "@roamhq/wrtc": "^0.10.0",
     "ws": "^8.18.3"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.82.0",
     "@earendil-works/pi-ai": "^0.82.0",
+    "@earendil-works/pi-coding-agent": "^0.82.0",
     "@types/ws": "^8.18.1",
     "typescript": "^7.0.2"
   }

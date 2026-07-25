@@ -106,7 +106,8 @@ export interface RealtimeConnectConfig {
 	voice?: string;
 	/** High-level mode — affects default session payload. */
 	mode?: "transcription" | "conversational";
-	/** Optional full session override merged into the default. */
+	/** Optional Codex CLI model override for the app-server child only. */
+	codexModel?: string;
 	session?: RealtimeSessionConfig;
 	/** Override WS URL origin (tests). Default: OpenAI GA endpoint. */
 	url?: string;
@@ -360,13 +361,17 @@ export function mergeSessionConfig(
 
 /** Map VoiceConfig → connect config (helper for later session wiring). */
 export function connectConfigFromVoice(
-	config: Pick<VoiceConfig, "model" | "sampleRate" | "voice" | "mode">,
+	config: Pick<
+		VoiceConfig,
+		"model" | "sampleRate" | "voice" | "mode" | "codexModel"
+	>,
 ): RealtimeConnectConfig {
 	return {
 		model: config.model,
 		sampleRate: config.sampleRate,
 		voice: config.voice,
 		mode: config.mode,
+		codexModel: config.codexModel,
 	};
 }
 

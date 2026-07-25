@@ -11,6 +11,16 @@ import type { VoiceAuthPrefer, VoiceMode } from "./types.js";
 
 export type VoiceRelayMode = "local" | "relay" | "both";
 
+/**
+ * Which realtime transport drives the voice session (VS9 / issue #16).
+ * - `openai` (default) — pi talks to the OpenAI Realtime WebSocket API directly.
+ * - `codex` — drive the local Codex CLI experimental app-server realtime and map
+ *   its `thread/realtime/*` events into the existing `/voice` UX. Requires the
+ *   `codex` binary; V3 bidi realtime works with ChatGPT/Codex OAuth (no API key
+ *   needed). Errors clearly when the CLI is unavailable.
+ */
+export type VoiceBackend = "openai" | "codex";
+
 export interface VoiceConfig {
 	/** `transcription` (default) or `conversational` (VS8 pi_turn). */
 	mode: VoiceMode;
@@ -24,6 +34,8 @@ export interface VoiceConfig {
 	auth: VoiceAuthPrefer;
 	/** Codex home directory (auth.json location). `~` is expanded. */
 	codexHome: string;
+	/** Optional Codex CLI model override for the spawned app-server only. */
+	codexModel?: string;
 	/** PCM sample rate in Hz (OpenAI Realtime GA default: 24000). */
 	sampleRate: number;
 	/**
@@ -47,6 +59,12 @@ export interface VoiceConfig {
 	relayMode: VoiceRelayMode;
 	/** Optional explicit API key override (never logged). */
 	apiKey?: string;
+	/**
+	 * Realtime backend selection (VS9). `openai` (default) keeps the pi-native
+	 * Realtime WebSocket path; `codex` drives experimental app-server realtime
+	 * (V2 text for transcription, V3 audio for conversational).
+	 */
+	backend: VoiceBackend;
 }
 
 const DEFAULTS = {
@@ -56,7 +74,13 @@ const DEFAULTS = {
 	auth: "auto" as VoiceAuthPrefer,
 	sampleRate: 24_000,
 	relayMode: "local" as VoiceRelayMode,
+	backend: "openai" as VoiceBackend,
 } as const;
+
+function parseBackend(raw: string | undefined): VoiceBackend {
+	if (raw === "codex" || raw === "openai") return raw;
+	return DEFAULTS.backend;
+}
 
 function expandHome(path: string): string {
 	if (path === "~") return homedir();
@@ -109,6 +133,7 @@ export function loadVoiceConfig(
 		tts: resolveTtsBackend(env.PI_VOICE_TTS),
 		auth: parseAuth(env.PI_VOICE_AUTH?.trim()),
 		codexHome: expandHome(codexHomeRaw),
+		codexModel: env.PI_VOICE_CODEX_MODEL?.trim() || undefined,
 		sampleRate: parseSampleRate(env.PI_VOICE_SAMPLE_RATE?.trim()),
 		inputDevice: env.PI_VOICE_INPUT_DEVICE?.trim() || undefined,
 		relayTarget,
@@ -117,6 +142,7 @@ export function loadVoiceConfig(
 			Boolean(relayTarget),
 		),
 		apiKey: apiKey || undefined,
+		backend: parseBackend(env.PI_VOICE_BACKEND?.trim()),
 	};
 }
 

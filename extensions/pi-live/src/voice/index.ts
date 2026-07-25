@@ -10,6 +10,7 @@
 export {
 	defaultVoiceConfig,
 	loadVoiceConfig,
+	type VoiceBackend,
 	type VoiceConfig,
 	type VoiceRelayMode,
 } from "./config.js";
@@ -61,6 +62,28 @@ export {
 	type TtsBackend,
 	type VoicePlaybackOptions,
 } from "./playback.js";
+
+export {
+	createVoiceClient,
+	CodexAppServerBackend,
+	CodexBackendError,
+	CodexWebRtcMedia,
+	loadWrtc,
+	resampleMono,
+	setWrtc,
+	type CodexWebRtcMediaOptions,
+	type WrtcAudioFrame,
+	type WrtcModule,
+	CODEX_V3_VOICES,
+	DEFAULT_CODEX_BIN,
+	detectCodexCli,
+	type CodexAppServerBackendOptions,
+	type CodexBackendErrorCode,
+	type CodexDetectResult,
+	type CodexSpawnFn,
+	type CodexTransport,
+	type CreateVoiceClientOptions,
+} from "./backends/index.js";
 
 export {
 	buildDefaultSessionConfig,
