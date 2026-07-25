@@ -9,6 +9,8 @@
  */
 
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { describe, it } from "node:test";
 
 import { loadVoiceConfig } from "../config.ts";
@@ -19,6 +21,7 @@ import {
 	CodexAppServerBackend,
 	CodexBackendError,
 	type CodexSpawnFn,
+	StdioCodexTransport,
 	type CodexTransport,
 } from "./codex-app-server.ts";
 import type {
@@ -263,6 +266,31 @@ describe("voice backend selection", () => {
 		const config = loadVoiceConfig({ PI_VOICE_BACKEND: "codex" });
 		assert.equal(config.backend, "codex");
 		assert.ok(createVoiceClient(config) instanceof CodexAppServerBackend);
+	});
+
+	it("passes a voice-only Codex model override to the app-server", () => {
+		const calls: Array<{ args: string[] }> = [];
+		const child = Object.assign(new EventEmitter(), {
+			stdin: new PassThrough(),
+			stdout: new PassThrough(),
+			stderr: new PassThrough(),
+			kill: () => true,
+		});
+		const spawn: CodexSpawnFn = (_bin, args) => {
+			calls.push({ args });
+			return child as never;
+		};
+		new StdioCodexTransport(spawn, "codex", {}, "gpt-5.6-terra");
+		assert.deepEqual(calls[0]?.args, [
+			"app-server",
+			"--config",
+			'model="gpt-5.6-terra"',
+			"--stdio",
+		]);
+		assert.equal(
+			loadVoiceConfig({ PI_VOICE_CODEX_MODEL: "gpt-5.6-terra" }).codexModel,
+			"gpt-5.6-terra",
+		);
 	});
 });
 

@@ -129,7 +129,7 @@ Codex realtime limitations:
 - The exact `thread/realtime/transcript/done` wire name is inferred from the protocol type and remains an experimental compatibility assumption.
 - Live `updateSession` and OpenAI-style function-call/cancel/truncate methods are unavailable; stop and restart voice after changing modes.
 - Codex V3 audio only accepts these voices: `juniper, maple, spruce, ember, vale, breeze, arbor, sol, cove`. The adapter silently drops an unsupported name (including the OpenAI default `marin`) and lets Codex pick its own.
-- On the WebRTC path the realtime session is created from Codex's own configuration, so `session.model` is not client-settable — `PI_VOICE_MODEL` is dropped there. Set the model in `~/.codex/config.toml` instead.
+- On the WebRTC path the realtime session is created from Codex's own configuration, so `session.model` is not client-settable — `PI_VOICE_MODEL` is dropped there. It normally reads `~/.codex/config.toml`; set `PI_VOICE_CODEX_MODEL` to pass an isolated `codex app-server --config model=…` override without changing your normal Codex model.
 - End-of-speech on the WebRTC path is inferred from a ~700 ms silence gap on the remote track, since the transport exposes no output-audio completion event.
 
 These differences are confined to the thin `RealtimeClientLike` adapter; the default OpenAI client and pi-native session path are not rewritten.
@@ -193,7 +193,8 @@ Transcript widget (above the editor, when `setWidget` is available):
 | --- | --- | --- |
 | `PI_VOICE_BACKEND` | `openai` | `openai` (pi-native direct WebSocket) or `codex` (experimental app-server realtime: V2 text / V3 audio) |
 | `PI_VOICE_MODE` | `transcription` | `transcription` (default) or `conversational` (Realtime audio + `pi_turn` on the OpenAI backend) |
-| `PI_VOICE_MODEL` | `gpt-realtime-2.1` | Realtime model id. **Ignored on the codex WebRTC path** (conversational): that session is minted from `~/.codex/config.toml` and rejects a client-supplied model |
+| `PI_VOICE_MODEL` | `gpt-realtime-2.1` | Realtime model id. **Ignored on the codex WebRTC path** (conversational) because that session is minted by Codex |
+| `PI_VOICE_CODEX_MODEL` | *(unset)* | Codex model for the spawned app-server only. Use when the model in `~/.codex/config.toml` is unsupported for ChatGPT OAuth realtime (for example, `gpt-5.6-terra`) |
 | `PI_VOICE_VOICE` | `marin` | TTS voice (OpenAI names for `openai`; macOS voice name for `say`, e.g. `Samantha`) |
 | `PI_VOICE_TTS` | `say` on macOS, else `off` | Speak-back backend: `say` \| `openai` \| `off` |
 | `PI_VOICE_AUTH` | `auto` | `auto` \| `codex` \| `api-key` |
@@ -243,6 +244,8 @@ codex login
 export PI_VOICE_BACKEND=codex
 export PI_VOICE_MODE=conversational   # WebRTC; OAuth is sufficient
 export PI_VOICE_VOICE=juniper         # a supported V3 voice (default marin is dropped)
+# Optional: isolate voice from an unsupported global Codex model (e.g. gpt-5.6-sol):
+export PI_VOICE_CODEX_MODEL=gpt-5.6-terra
 # For transcription instead, a key IS required (WebSocket realtime rejects OAuth):
 #   export PI_VOICE_MODE=transcription
 #   export PI_VOICE_API_KEY='sk-...'   # or export OPENAI_API_KEY='sk-...'
@@ -298,6 +301,7 @@ Without `play`, barge-in truncate timing still works; you just won't hear audio 
 | `requires the \`@roamhq/wrtc\` native module` | Run `npm install` in `extensions/pi-live`. The binary ships as a platform package (e.g. `@roamhq/wrtc-darwin-arm64`) and needs no install-script approval. |
 | Transcripts appear but **no audio is heard** | Check you're on `@roamhq/wrtc`, not `@koush/wrtc` — the latter discards every inbound RTP packet before the decoder, so the remote track is permanently silent. `npm ls @roamhq/wrtc` should resolve. |
 | `Field \`session.model\` is not allowed for this Codex realtime session` | Fixed — the adapter no longer sends a model over WebRTC. If you still see it, update to the latest branch/PR version. Choose the model in `~/.codex/config.toml`. |
+| `gpt-5.6-sol` (or another Codex model) `is not supported when using Codex with a ChatGPT account` | The app-server reads your global `~/.codex/config.toml` model for WebRTC. Keep that setting for normal Codex if desired, but set `PI_VOICE_CODEX_MODEL=gpt-5.6-terra` before launching pi to override the **voice child only**, then restart `/voice`. |
 | `codex realtime rejected start` | Check the full reported message, Codex version, and model/account entitlement. Use `PI_VOICE_BACKEND=openai` to return to the default backend. |
 | `sox/rec not found on PATH` | `brew install sox`; ensure Homebrew’s bin is on `PATH` inside the pi process. |
 | WS 401 / 403 | OAuth expired — re-login via Codex; or switch to a valid API key. |

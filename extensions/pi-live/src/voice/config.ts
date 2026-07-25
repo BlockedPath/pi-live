@@ -34,6 +34,8 @@ export interface VoiceConfig {
 	auth: VoiceAuthPrefer;
 	/** Codex home directory (auth.json location). `~` is expanded. */
 	codexHome: string;
+	/** Optional Codex CLI model override for the spawned app-server only. */
+	codexModel?: string;
 	/** PCM sample rate in Hz (OpenAI Realtime GA default: 24000). */
 	sampleRate: number;
 	/**
@@ -131,6 +133,7 @@ export function loadVoiceConfig(
 		tts: resolveTtsBackend(env.PI_VOICE_TTS),
 		auth: parseAuth(env.PI_VOICE_AUTH?.trim()),
 		codexHome: expandHome(codexHomeRaw),
+		codexModel: env.PI_VOICE_CODEX_MODEL?.trim() || undefined,
 		sampleRate: parseSampleRate(env.PI_VOICE_SAMPLE_RATE?.trim()),
 		inputDevice: env.PI_VOICE_INPUT_DEVICE?.trim() || undefined,
 		relayTarget,

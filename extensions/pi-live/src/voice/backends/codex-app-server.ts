@@ -84,8 +84,9 @@
  *  G8. A WebRTC realtime session is minted server-side from Codex's OWN config,
  *      so `session.model` is not client-settable: passing one fails with
  *      "Field `session.model` is not allowed for this Codex realtime session".
- *      `PI_VOICE_MODEL` is therefore ignored on the WebRTC path (the model comes
- *      from `~/.codex/config.toml`); it is still forwarded over WebSocket.
+ *      `PI_VOICE_MODEL` is therefore ignored on the WebRTC path; the model comes
+ *      from `~/.codex/config.toml` unless `PI_VOICE_CODEX_MODEL` overrides the
+ *      spawned app-server's CLI config. It is still forwarded over WebSocket.
  *  G9. The WebRTC remote track emits a CONTINUOUS 10 ms frame stream for the
  *      whole session, including digital silence between utterances (verified:
  *      a sender that stops feeding entirely still yields frames, RMS 0). Those
@@ -182,8 +183,18 @@ export class StdioCodexTransport implements CodexTransport {
 	#stderrBuf = "";
 	#closed = false;
 
-	constructor(spawnFn: CodexSpawnFn, codexBin: string, env: NodeJS.ProcessEnv) {
-		this.#child = spawnFn(codexBin, ["app-server", "--stdio"], {
+	constructor(
+		spawnFn: CodexSpawnFn,
+		codexBin: string,
+		env: NodeJS.ProcessEnv,
+		codexModel?: string,
+	) {
+		const args = [
+			"app-server",
+			...(codexModel ? ["--config", `model=${JSON.stringify(codexModel)}`] : []),
+			"--stdio",
+		];
+		this.#child = spawnFn(codexBin, args, {
 			stdio: ["pipe", "pipe", "pipe"],
 			env,
 		});
@@ -452,6 +463,7 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 			voice?: string;
 			mode?: "transcription" | "conversational";
 			sampleRate?: number;
+			codexModel?: string;
 		};
 
 		// 1. CLI presence precheck (clear error instead of a cryptic spawn ENOENT).
@@ -475,7 +487,7 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 		// to the child environment as OPENAI_API_KEY for V2 text fallback.
 		const transport =
 			this.#injectedTransport ??
-			this.#spawnTransport(this.#appServerEnv(authHeaders));
+			this.#spawnTransport(this.#appServerEnv(authHeaders), cfg.codexModel);
 		this.#transport = transport;
 		transport.onLine((line) => this.#handleLine(line));
 		transport.onError((err) => this.#handleTransportError(err));
@@ -604,12 +616,12 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 		return token ? { ...this.#env, OPENAI_API_KEY: token } : this.#env;
 	}
 
-	#spawnTransport(env: NodeJS.ProcessEnv): CodexTransport {
+	#spawnTransport(env: NodeJS.ProcessEnv, codexModel?: string): CodexTransport {
 		if (!this.#spawn) {
 			// Production default — real child_process.spawn.
-			return new StdioCodexTransport(spawn, this.#codexBin, env);
+			return new StdioCodexTransport(spawn, this.#codexBin, env, codexModel);
 		}
-		return new StdioCodexTransport(this.#spawn, this.#codexBin, env);
+		return new StdioCodexTransport(this.#spawn, this.#codexBin, env, codexModel);
 	}
 
 	#teardownTransport(): void {
