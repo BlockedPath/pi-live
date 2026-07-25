@@ -332,6 +332,36 @@ export function detectCodexCli(
 	});
 }
 
+/**
+ * Preserve an app-server realtime error instead of replacing it with the
+ * unhelpful generic label. The experimental V3 protocol has shipped multiple
+ * shapes (`message`, `{error:{message}}`, and structured error details).
+ * Error notifications contain no credentials, but still cap the rendered JSON
+ * so a malformed server response cannot flood the voice UI.
+ */
+function formatRealtimeError(params: Record<string, unknown>): string {
+	const error = params.error;
+	if (typeof params.message === "string" && params.message.trim()) {
+		return params.message.trim();
+	}
+	if (error && typeof error === "object") {
+		const nested = error as Record<string, unknown>;
+		if (typeof nested.message === "string" && nested.message.trim()) {
+			return nested.message.trim();
+		}
+		if (typeof nested.error === "string" && nested.error.trim()) {
+			return nested.error.trim();
+		}
+	}
+	if (typeof error === "string" && error.trim()) return error.trim();
+	try {
+		const rendered = JSON.stringify(params);
+		return rendered.length > 1_000 ? `${rendered.slice(0, 997)}…` : rendered;
+	} catch {
+		return "Codex realtime error (unserializable error payload)";
+	}
+}
+
 type Handler = (...args: unknown[]) => void;
 
 interface PendingRequest {
@@ -606,7 +636,9 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 				offStarted();
 				offError();
 				offClosed();
-				const msg = (ev as { message?: string })?.message ?? "realtime error";
+				const msg = formatRealtimeError(
+					(ev && typeof ev === "object" ? ev : {}) as Record<string, unknown>,
+				);
 				reject(
 					new CodexBackendError(
 						"no_realtime",
@@ -873,10 +905,7 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 				break;
 			}
 			case "thread/realtime/error": {
-				const message =
-					typeof params.message === "string"
-						? params.message
-						: "codex realtime error";
+				const message = formatRealtimeError(params);
 				this.#emit("error", { message, raw: params });
 				break;
 			}

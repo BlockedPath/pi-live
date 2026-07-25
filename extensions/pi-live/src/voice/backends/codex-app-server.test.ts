@@ -583,6 +583,32 @@ describe("CodexAppServerBackend — event mapping", () => {
 		assert.match((errors[0] as { message: string }).message, /boom/);
 	});
 
+	it("preserves nested and structured realtime error details", async () => {
+		const transport = new FakeTransport();
+		const backend = new CodexAppServerBackend({ transport, skipDetect: true });
+		await happyConnect(backend, transport);
+		const errors: unknown[] = [];
+		backend.on("error", (e) => errors.push(e));
+
+		transport.receive({
+			method: "thread/realtime/error",
+			params: {
+				threadId: "thr_123",
+				error: { code: "upstream_failure", message: "provider overloaded" },
+			},
+		});
+		assert.equal((errors[0] as { message: string }).message, "provider overloaded");
+
+		transport.receive({
+			method: "thread/realtime/error",
+			params: { threadId: "thr_123", code: "upstream_failure", details: "retry" },
+		});
+		assert.match(
+			(errors[1] as { message: string }).message,
+			/"code":"upstream_failure"/,
+		);
+	});
+
 	it("surfaces thread/realtime/closed as a client close event", async () => {
 		const transport = new FakeTransport();
 		const backend = new CodexAppServerBackend({ transport, skipDetect: true });
