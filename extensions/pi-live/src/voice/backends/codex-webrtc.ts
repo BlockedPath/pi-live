@@ -189,17 +189,42 @@ export function resampleMono(
 	return out;
 }
 
+/** RMS of a mono Int16 frame (0 for digital silence). */
+function frameRms(samples: Int16Array): number {
+	if (samples.length === 0) return 0;
+	let sum = 0;
+	for (let i = 0; i < samples.length; i++) {
+		const s = samples[i] ?? 0;
+		sum += s * s;
+	}
+	return Math.sqrt(sum / samples.length);
+}
+
 export interface CodexWebRtcMediaOptions {
 	/** Injectable wrtc (tests). Production loads lazily via {@link loadWrtc}. */
 	wrtc?: WrtcModule;
 	/** Called with base64 PCM16 @ 24 kHz mono for each decoded remote frame. */
 	onAudio: (base64: string, itemId?: string) => void;
+	/**
+	 * Called once the remote track has been continuously silent for
+	 * {@link CodexWebRtcMediaOptions.silenceHoldMs}. Lets the backend finalize
+	 * playback so capture can resume (see G9).
+	 */
+	onAudioIdle?: () => void;
 	/** Optional state-change logger (connectionState transitions). */
 	onState?: (state: string) => void;
 	/** Session PCM rate the mic arrives at (default 24000). */
 	micSampleRate?: number;
 	/** Output PCM rate for the remote audio delta (default 24000). */
 	outSampleRate?: number;
+	/**
+	 * Frames whose RMS is at or below this are treated as silence and not
+	 * forwarded (default 120). Measured speech sits around 8000+ while the
+	 * track's idle comfort noise is 0, so this is a wide margin.
+	 */
+	silenceRmsThreshold?: number;
+	/** Continuous silence before {@link onAudioIdle} fires (default 700 ms). */
+	silenceHoldMs?: number;
 }
 
 /**
@@ -210,9 +235,12 @@ export interface CodexWebRtcMediaOptions {
 export class CodexWebRtcMedia {
 	readonly #wrtc: WrtcModule;
 	readonly #onAudio: (base64: string, itemId?: string) => void;
+	readonly #onAudioIdle?: () => void;
 	readonly #onState?: (state: string) => void;
 	readonly #micRate: number;
 	readonly #outRate: number;
+	readonly #silenceRms: number;
+	readonly #silenceHoldMs: number;
 
 	#pc: WrtcPeerConnection | undefined;
 	#source: WrtcAudioSource | undefined;
@@ -221,13 +249,19 @@ export class CodexWebRtcMedia {
 	/** Leftover mic samples buffered until a full 10 ms frame is available. */
 	#micBuf: number[] = [];
 	#closed = false;
+	/** True while the remote track is actively carrying non-silent audio. */
+	#remoteActive = false;
+	#silenceTimer: NodeJS.Timeout | undefined;
 
 	constructor(options: CodexWebRtcMediaOptions) {
 		this.#wrtc = options.wrtc ?? loadWrtc();
 		this.#onAudio = options.onAudio;
+		this.#onAudioIdle = options.onAudioIdle;
 		this.#onState = options.onState;
 		this.#micRate = options.micSampleRate ?? 24_000;
 		this.#outRate = options.outSampleRate ?? 24_000;
+		this.#silenceRms = options.silenceRmsThreshold ?? 120;
+		this.#silenceHoldMs = options.silenceHoldMs ?? 700;
 	}
 
 	/** Build the local SDP offer (with gathered ICE candidates) to send to the app-server. */
@@ -300,6 +334,19 @@ export class CodexWebRtcMedia {
 	#onRemoteFrame(frame: WrtcAudioFrame): void {
 		if (this.#closed) return;
 		const mono = downmixMono(frame);
+
+		// G9: the sink emits a continuous 10 ms frame stream for the whole session,
+		// including digital silence between utterances. Forwarding those kept
+		// `PcmStreamPlayer` permanently "speaking", which holds capture paused for
+		// echo suppression — so the mic never reopened after the first reply.
+		// Only forward audible frames, and finalize playback after a silence gap.
+		if (frameRms(mono) <= this.#silenceRms) {
+			if (this.#remoteActive) this.#armSilenceTimer();
+			return;
+		}
+		this.#clearSilenceTimer();
+		this.#remoteActive = true;
+
 		const resampled = resampleMono(mono, frame.sampleRate, this.#outRate);
 		if (resampled.length === 0) return;
 		// Int16Array → little-endian bytes → base64.
@@ -310,10 +357,30 @@ export class CodexWebRtcMedia {
 		this.#onAudio(buf.toString("base64"));
 	}
 
+	#armSilenceTimer(): void {
+		if (this.#silenceTimer) return;
+		const timer = setTimeout(() => {
+			this.#silenceTimer = undefined;
+			if (this.#closed || !this.#remoteActive) return;
+			this.#remoteActive = false;
+			this.#onAudioIdle?.();
+		}, this.#silenceHoldMs);
+		timer.unref?.();
+		this.#silenceTimer = timer;
+	}
+
+	#clearSilenceTimer(): void {
+		if (!this.#silenceTimer) return;
+		clearTimeout(this.#silenceTimer);
+		this.#silenceTimer = undefined;
+	}
+
 	/** Tear down the peer connection and audio source/sink. */
 	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;
+		this.#clearSilenceTimer();
+		this.#remoteActive = false;
 		this.#micBuf = [];
 		try {
 			this.#sink?.stop();

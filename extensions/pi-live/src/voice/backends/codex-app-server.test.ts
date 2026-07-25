@@ -787,6 +787,86 @@ describe("CodexAppServerBackend — WebRTC media (G7)", () => {
 		backend.close();
 	});
 
+	/**
+	 * G9 regression: the remote track emits frames CONTINUOUSLY for the whole
+	 * session, including digital silence between utterances. Forwarding those as
+	 * audio.delta keeps PcmStreamPlayer "speaking" forever, which makes the
+	 * session hold mic capture paused for echo suppression — the mic never
+	 * reopens after the first reply.
+	 */
+	it("drops silent remote frames so playback does not stay speaking (G9)", async () => {
+		const { backend, wrtc } = await connectWebRtc();
+		const audioDeltas: unknown[] = [];
+		backend.on("audio.delta", (e) => audioDeltas.push(e));
+		wrtc.pcs[0]?.emitTrack({ kind: "audio", enabled: true, stop() {} });
+		const sink = wrtc.sinks[0];
+
+		const emit = (fill: (i: number) => number) => {
+			const samples = new Int16Array(240);
+			for (let i = 0; i < 240; i++) samples[i] = fill(i);
+			sink?.emit({
+				samples,
+				sampleRate: 24_000,
+				bitsPerSample: 16,
+				channelCount: 1,
+				numberOfFrames: 240,
+			});
+		};
+
+		// Digital silence (what an idle track sends) must not be forwarded.
+		emit(() => 0);
+		assert.equal(audioDeltas.length, 0, "silent frames must be dropped");
+
+		// Real speech is forwarded.
+		emit((i) => (i % 2 === 0 ? 8000 : -8000));
+		assert.equal(audioDeltas.length, 1, "audible frames must pass through");
+
+		// Silence after speech is still dropped.
+		emit(() => 0);
+		assert.equal(audioDeltas.length, 1);
+		backend.close();
+	});
+
+	it("finalizes playback with audio.done after a remote silence gap (G9)", async () => {
+		const transport = new FakeTransport();
+		const wrtc = new MockWrtc();
+		const backend = new CodexAppServerBackend({
+			transport,
+			skipDetect: true,
+			wrtc,
+		});
+		await happyConnect(backend, transport, "conversational");
+		const done: unknown[] = [];
+		backend.on("audio.done", (e) => done.push(e));
+		wrtc.pcs[0]?.emitTrack({ kind: "audio", enabled: true, stop() {} });
+		const sink = wrtc.sinks[0];
+
+		const emit = (level: number) => {
+			const samples = new Int16Array(240);
+			for (let i = 0; i < 240; i++) samples[i] = i % 2 === 0 ? level : -level;
+			sink?.emit({
+				samples,
+				sampleRate: 24_000,
+				bitsPerSample: 16,
+				channelCount: 1,
+				numberOfFrames: 240,
+			});
+		};
+
+		// Speech, then silence. audio.done fires only after the silence hold.
+		emit(8000);
+		emit(0);
+		assert.equal(done.length, 0, "must not finalize immediately");
+		await new Promise((r) => setTimeout(r, 900));
+		assert.equal(done.length, 1, "silence gap finalizes playback");
+
+		// Idle silence must not emit a second audio.done.
+		emit(0);
+		await new Promise((r) => setTimeout(r, 900));
+		assert.equal(done.length, 1, "no repeated audio.done while idle");
+		backend.close();
+	});
+
 	it("close() tears down the peer connection, track, and sink", async () => {
 		const { backend, wrtc } = await connectWebRtc();
 		wrtc.pcs[0]?.emitTrack({ kind: "audio", enabled: true, stop() {} });

@@ -86,6 +86,14 @@
  *      "Field `session.model` is not allowed for this Codex realtime session".
  *      `PI_VOICE_MODEL` is therefore ignored on the WebRTC path (the model comes
  *      from `~/.codex/config.toml`); it is still forwarded over WebSocket.
+ *  G9. The WebRTC remote track emits a CONTINUOUS 10 ms frame stream for the
+ *      whole session, including digital silence between utterances (verified:
+ *      a sender that stops feeding entirely still yields frames, RMS 0). Those
+ *      frames must NOT be forwarded as `audio.delta`, or `PcmStreamPlayer` stays
+ *      permanently "speaking" and the session holds mic capture paused for echo
+ *      suppression — the mic never reopens after the first reply. `codex-webrtc`
+ *      gates on frame RMS and reports an `onAudioIdle` silence gap, which we map
+ *      to `audio.done` since the transport has no end-of-utterance event.
  *
  * Unit tests inject a fake `CodexTransport` — no real `codex` process and no
  * network are required.
@@ -511,6 +519,15 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 							timestamp: Date.now(),
 						};
 						this.#emit("audio.delta", ev);
+					},
+					// G9: the remote track never stops emitting frames, so a silence gap
+					// is the only available end-of-utterance signal on this transport.
+					// Without it playback stays "speaking" and capture is held paused.
+					onAudioIdle: () => {
+						this.#emit("audio.done", {
+							itemId: undefined,
+							timestamp: Date.now(),
+						});
 					},
 				});
 				this.#media = media;
