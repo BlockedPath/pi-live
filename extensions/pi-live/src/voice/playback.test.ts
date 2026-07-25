@@ -9,6 +9,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { describe, it } from "node:test";
 import type { ChildProcess } from "node:child_process";
+import { platform } from "node:os";
 
 import {
 	DEFAULT_SPEAK_MAX_CHARS,
@@ -278,22 +279,29 @@ describe("PcmStreamPlayer", () => {
 		player.stop();
 	});
 
-	it("handles an asynchronous SoX stdin EPIPE without crashing pi", () => {
+	it("falls back to a WAV player after an asynchronous SoX stdin EPIPE", async () => {
 		const spawned: ReturnType<typeof streamChild>[] = [];
+		const commands: string[] = [];
 		const player = new PcmStreamPlayer({
-			spawn: () => {
+			spawn: (command) => {
+				commands.push(command);
+				if (command !== "play") return fakeChild(0, 1);
 				const next = streamChild();
 				spawned.push(next);
 				return next.child;
 			},
 		});
-		player.appendBase64(Buffer.from([1, 2]).toString("base64"));
+		player.appendBase64(Buffer.from([1, 2, 3, 4]).toString("base64"));
 		assert.doesNotThrow(() => {
 			spawned[0]?.stdin.emit(
 				"error",
 				Object.assign(new Error("write EPIPE"), { code: "EPIPE" }),
 			);
 		});
-		assert.equal(player.isSpeaking(), false);
+		player.done();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.ok(
+			commands.includes(platform() === "darwin" ? "afplay" : "ffplay"),
+		);
 	});
 });

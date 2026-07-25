@@ -482,6 +482,24 @@ export interface PcmStreamPlayerOptions {
 	spawn?: SpawnFn;
 }
 
+function writeWavPcm16Mono(pcm: Buffer, sampleRate: number): Buffer {
+	const dataSize = pcm.byteLength;
+	const header = Buffer.alloc(44);
+	header.write("RIFF", 0);
+	header.writeUInt32LE(36 + dataSize, 4);
+	header.write("WAVE", 8);
+	header.write("fmt ", 12);
+	header.writeUInt32LE(16, 16);
+	header.writeUInt16LE(1, 20);
+	header.writeUInt16LE(1, 22);
+	header.writeUInt32LE(sampleRate, 24);
+	header.writeUInt32LE(sampleRate * 2, 28);
+	header.writeUInt16LE(2, 32);
+	header.writeUInt16LE(16, 34);
+	header.write("data", 36);
+	header.writeUInt32LE(dataSize, 40);
+	return Buffer.concat([header, pcm]);
+}
 export class PcmStreamPlayer {
 	readonly #sampleRate: number;
 	readonly #spawn: SpawnFn;
@@ -490,6 +508,9 @@ export class PcmStreamPlayer {
 	#child: ChildProcess | undefined;
 	/** PCM received while the previous stream is draining after `done()`. */
 	#queued: Buffer[] = [];
+	/** Retained only to fall back to afplay/ffplay if the streaming pipe breaks. */
+	#fallbackChunks: Buffer[] = [];
+	#pipeFailed = false;
 	#bytesWritten = 0;
 	#itemId: string | undefined;
 	#speaking = false;
@@ -545,6 +566,7 @@ export class PcmStreamPlayer {
 		if (itemId) this.#itemId = itemId;
 		this.#hasAudio = true;
 		this.#bytesWritten += buf.byteLength;
+		this.#fallbackChunks.push(buf);
 		this.#setSpeaking(true);
 
 		if (this.#child && !this.#streamEnding) {
@@ -562,6 +584,18 @@ export class PcmStreamPlayer {
 	 * prevents two system players from overlapping.
 	 */
 	done(): void {
+		if (this.#pipeFailed) {
+			const pcm = Buffer.concat(this.#fallbackChunks);
+			this.#fallbackChunks = [];
+			this.#pipeFailed = false;
+			if (pcm.byteLength >= 4) {
+				void this.#playFallback(pcm, this.#generation);
+			} else {
+				this.#setSpeaking(false);
+			}
+			return;
+		}
+		this.#fallbackChunks = [];
 		const child = this.#child;
 		if (!child || this.#streamEnding) return;
 		this.#streamEnding = true;
@@ -581,6 +615,8 @@ export class PcmStreamPlayer {
 		const child = this.#child;
 		this.#child = undefined;
 		this.#queued = [];
+		this.#fallbackChunks = [];
+		this.#pipeFailed = false;
 		this.#bytesWritten = 0;
 		this.#itemId = undefined;
 		this.#hasAudio = false;
@@ -669,7 +705,10 @@ export class PcmStreamPlayer {
 		child.on("close", finish);
 		// `stdin.write()` reports a broken child pipe asynchronously. Without this
 		// listener Node treats EPIPE as an uncaught exception and exits pi.
-		child.stdin?.on("error", finish);
+		child.stdin?.on("error", () => {
+			this.#pipeFailed = true;
+			finish();
+		});
 		for (const chunk of queued) this.#write(chunk);
 	}
 
@@ -684,6 +723,44 @@ export class PcmStreamPlayer {
 		} catch {
 			// A broken local player must not tear down the realtime session.
 			this.#queued.push(chunk);
+		}
+	}
+	async #playFallback(pcm: Buffer, gen: number): Promise<void> {
+		if (gen !== this.#generation) return;
+		const file = join(
+			tmpdir(),
+			`pi-voice-rt-${randomBytes(8).toString("hex")}.wav`,
+		);
+		try {
+			await writeFile(file, writeWavPcm16Mono(pcm, this.#sampleRate));
+			if (gen !== this.#generation) return;
+			const player = platform() === "darwin" ? "afplay" : "ffplay";
+			const args =
+				player === "afplay"
+					? [file]
+					: ["-nodisp", "-autoexit", "-loglevel", "quiet", file];
+			const child = this.#spawn(player, args, {
+				stdio: "ignore",
+				env: process.env,
+			});
+			this.#child = child;
+			this.#playing = true;
+			await new Promise<void>((resolve) => {
+				const finish = () => resolve();
+				child.on("error", finish);
+				child.on("close", finish);
+			});
+		} catch {
+			// Playback is best-effort; keep the realtime session alive.
+		} finally {
+			if (gen === this.#generation) {
+				this.#child = undefined;
+				this.#playing = false;
+				this.#hasAudio = false;
+				this.#itemId = undefined;
+				this.#setSpeaking(false);
+			}
+			await unlink(file).catch(() => undefined);
 		}
 	}
 
