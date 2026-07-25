@@ -81,6 +81,11 @@
  *      offer is generated locally (non-trickle, ICE candidates included), sent
  *      as `transport:{type:"webrtc", sdp}`, and the app-server replies with a
  *      `thread/realtime/sdp` answer notification.
+ *  G8. A WebRTC realtime session is minted server-side from Codex's OWN config,
+ *      so `session.model` is not client-settable: passing one fails with
+ *      "Field `session.model` is not allowed for this Codex realtime session".
+ *      `PI_VOICE_MODEL` is therefore ignored on the WebRTC path (the model comes
+ *      from `~/.codex/config.toml`); it is still forwarded over WebSocket.
  *
  * Unit tests inject a fake `CodexTransport` — no real `codex` process and no
  * network are required.
@@ -467,12 +472,23 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 			const outputModality = cfg.mode === "conversational" ? "audio" : "text";
 			const version =
 				this.#version ?? (outputModality === "text" ? "v2" : "v3");
+
+			// Media transport. WebRTC is the only OAuth-capable path; the WebSocket
+			// PCM path needs an OpenAI API key. Text has no media plane.
+			const wantWebRtc =
+				(this.#realtimeTransport ??
+					(outputModality === "audio" ? "webrtc" : "websocket")) === "webrtc";
+
 			const realtimeParams: Record<string, unknown> = {
 				threadId,
 				outputModality,
 				version,
 			};
-			if (cfg.model) realtimeParams.model = cfg.model;
+			// G8: a WebRTC realtime session is minted server-side from Codex's own
+			// configuration, so it rejects a client-supplied model with
+			// "Field `session.model` is not allowed for this Codex realtime session".
+			// Only the WebSocket/API-key path accepts a model override.
+			if (cfg.model && !wantWebRtc) realtimeParams.model = cfg.model;
 			// V3 audio realtime rejects the OpenAI default `marin` and other unsupported
 			// voice names; only forward a voice the server accepts, else let it pick a
 			// default. V2 text tolerates any voice name (it produces no audio).
@@ -483,11 +499,6 @@ export class CodexAppServerBackend implements RealtimeClientLike {
 				realtimeParams.voice = cfg.voice;
 			}
 
-			// Media transport. WebRTC is the only OAuth-capable path; the WebSocket
-			// PCM path needs an OpenAI API key. Text has no media plane.
-			const wantWebRtc =
-				(this.#realtimeTransport ??
-					(outputModality === "audio" ? "webrtc" : "websocket")) === "webrtc";
 			if (wantWebRtc) {
 				const media = new CodexWebRtcMedia({
 					wrtc: this.#wrtc,

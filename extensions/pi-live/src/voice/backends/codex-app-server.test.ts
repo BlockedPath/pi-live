@@ -368,7 +368,41 @@ describe("CodexAppServerBackend — handshake", () => {
 		await connectPromise;
 		const realtime = transport.lastSentOfType("thread/realtime/start");
 		assert.equal(realtime?.voice, "juniper");
+		// G8: the WebRTC session is minted from Codex's own config and rejects a
+		// client-supplied model, so PI_VOICE_MODEL must not be forwarded here.
+		assert.equal(realtime?.model, undefined);
 		backend.close();
+	});
+
+	it("forwards the model on the WebSocket transport but not over WebRTC (G8)", async () => {
+		// Transcription/text keeps the WebSocket path, which does accept a model.
+		const wsTransport = new FakeTransport();
+		const wsBackend = new CodexAppServerBackend({
+			transport: wsTransport,
+			skipDetect: true,
+			wrtc: new MockWrtc(),
+		});
+		await happyConnect(wsBackend, wsTransport, "transcription");
+		assert.equal(
+			wsTransport.lastSentOfType("thread/realtime/start")?.model,
+			"gpt-realtime-2.1",
+		);
+		wsBackend.close();
+
+		// An explicit webrtc override on text must also drop the model.
+		const rtcTransport = new FakeTransport();
+		const rtcBackend = new CodexAppServerBackend({
+			transport: rtcTransport,
+			skipDetect: true,
+			wrtc: new MockWrtc(),
+			realtimeTransport: "webrtc",
+		});
+		await happyConnect(rtcBackend, rtcTransport, "transcription");
+		assert.equal(
+			rtcTransport.lastSentOfType("thread/realtime/start")?.model,
+			undefined,
+		);
+		rtcBackend.close();
 	});
 
 	it("rejects when thread/realtime/error arrives before started", async () => {

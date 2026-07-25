@@ -131,6 +131,7 @@ Codex realtime limitations:
 - The exact `thread/realtime/transcript/done` wire name is inferred from the protocol type and remains an experimental compatibility assumption.
 - Live `updateSession` and OpenAI-style function-call/cancel/truncate methods are unavailable; stop and restart voice after changing modes.
 - Codex V3 audio only accepts these voices: `juniper, maple, spruce, ember, vale, breeze, arbor, sol, cove`. The adapter silently drops an unsupported name (including the OpenAI default `marin`) and lets Codex pick its own.
+- On the WebRTC path the realtime session is created from Codex's own configuration, so `session.model` is not client-settable — `PI_VOICE_MODEL` is dropped there. Set the model in `~/.codex/config.toml` instead.
 
 These differences are confined to the thin `RealtimeClientLike` adapter; the default OpenAI client and pi-native session path are not rewritten.
 
@@ -193,7 +194,7 @@ Transcript widget (above the editor, when `setWidget` is available):
 | --- | --- | --- |
 | `PI_VOICE_BACKEND` | `openai` | `openai` (pi-native direct WebSocket) or `codex` (experimental app-server realtime: V2 text / V3 audio) |
 | `PI_VOICE_MODE` | `transcription` | `transcription` (default) or `conversational` (Realtime audio + `pi_turn` on the OpenAI backend) |
-| `PI_VOICE_MODEL` | `gpt-realtime-2.1` | Realtime model id |
+| `PI_VOICE_MODEL` | `gpt-realtime-2.1` | Realtime model id. **Ignored on the codex WebRTC path** (conversational): that session is minted from `~/.codex/config.toml` and rejects a client-supplied model |
 | `PI_VOICE_VOICE` | `marin` | TTS voice (OpenAI names for `openai`; macOS voice name for `say`, e.g. `Samantha`) |
 | `PI_VOICE_TTS` | `say` on macOS, else `off` | Speak-back backend: `say` \| `openai` \| `off` |
 | `PI_VOICE_AUTH` | `auto` | `auto` \| `codex` \| `api-key` |
@@ -296,6 +297,7 @@ Without `play`, barge-in truncate timing still works; you just won't hear audio 
 | `realtime voice \`<name>\` is not supported for v3` | Codex V3 audio only accepts: juniper, maple, spruce, ember, vale, breeze, arbor, sol, cove. The adapter drops an unsupported `PI_VOICE_VOICE` (e.g. the default `marin`) and lets Codex pick its own; set `PI_VOICE_VOICE=juniper` to choose one. |
 | `realtime conversation requires API key auth` | You're on a WebSocket-transport realtime session with ChatGPT OAuth. Use `PI_VOICE_MODE=conversational` (WebRTC, OAuth works), or set `OPENAI_API_KEY` / `PI_VOICE_API_KEY` for transcription. |
 | `requires the \`@koush/wrtc\` native module` | The WebRTC prebuilt binary didn't install (npm blocked the install script). Run `npm install-scripts approve @koush/wrtc` and reinstall, or `npx node-pre-gyp install --directory=node_modules/@koush/wrtc`. |
+| `Field \`session.model\` is not allowed for this Codex realtime session` | Fixed — the adapter no longer sends a model over WebRTC. If you still see it, update to the latest branch/PR version. Choose the model in `~/.codex/config.toml`. |
 | `codex realtime rejected start` | Check the full reported message, Codex version, and model/account entitlement. Use `PI_VOICE_BACKEND=openai` to return to the default backend. |
 | `sox/rec not found on PATH` | `brew install sox`; ensure Homebrew’s bin is on `PATH` inside the pi process. |
 | WS 401 / 403 | OAuth expired — re-login via Codex; or switch to a valid API key. |
