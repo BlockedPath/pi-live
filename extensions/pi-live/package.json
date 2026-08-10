@@ -16,7 +16,7 @@
     ]
   },
   "dependencies": {
-    "ws": "^8.18.3"
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.1",
