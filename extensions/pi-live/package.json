@@ -19,8 +19,8 @@
     "ws": "^8.22.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.87.1",
-    "@earendil-works/pi-ai": "^0.87.1",
+    "@earendil-works/pi-coding-agent": "^1.1.0",
+    "@earendil-works/pi-ai": "^1.1.0",
     "@types/ws": "^8.18.2",
     "typescript": "^7.0.2"
   }
